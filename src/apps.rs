@@ -312,3 +312,154 @@ pub fn build_visible(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) -> 
     out.extend(rest);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, name: &str) -> AppEntry {
+        AppEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            icon: None,
+            exec: Some("/usr/bin/true".to_string()),
+            no_display: false,
+            hidden: false,
+        }
+    }
+
+    #[test]
+    fn strip_empty() {
+        assert_eq!(strip_exec_field_codes(""), "");
+    }
+
+    #[test]
+    fn strip_no_codes() {
+        assert_eq!(strip_exec_field_codes("firefox"), "firefox");
+    }
+
+    #[test]
+    fn strip_percent_f() {
+        assert_eq!(strip_exec_field_codes("app %f"), "app ");
+    }
+
+    #[test]
+    fn strip_percent_u() {
+        assert_eq!(strip_exec_field_codes("app %u"), "app ");
+    }
+
+    #[test]
+    fn strip_percent_caps() {
+        assert_eq!(strip_exec_field_codes("app %F"), "app ");
+        assert_eq!(strip_exec_field_codes("app %U %F"), "app  ");
+    }
+
+    #[test]
+    fn strip_double_percent() {
+        assert_eq!(strip_exec_field_codes("app %%f"), "app %f");
+        assert_eq!(strip_exec_field_codes("%%"), "%");
+    }
+
+    #[test]
+    fn strip_trailing_percent() {
+        assert_eq!(strip_exec_field_codes("app %"), "app %");
+    }
+
+    #[test]
+    fn build_visible_pinned_first() {
+        let mut entries = BTreeMap::new();
+        entries.insert("b".to_string(), entry("b", "Beta"));
+        entries.insert("a".to_string(), entry("a", "Alpha"));
+        let cfg = AppsConfig {
+            pinned: vec!["b".to_string()],
+            ..Default::default()
+        };
+        let visible = build_visible(&entries, &cfg);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].id, "b");
+        assert_eq!(visible[1].id, "a");
+    }
+
+    #[test]
+    fn build_visible_hidden_filter() {
+        let mut entries = BTreeMap::new();
+        entries.insert("a".to_string(), entry("a", "Alpha"));
+        entries.insert("b".to_string(), entry("b", "Beta"));
+        let cfg = AppsConfig {
+            hidden: vec!["b".to_string()],
+            ..Default::default()
+        };
+        let visible = build_visible(&entries, &cfg);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "a");
+    }
+
+    #[test]
+    fn build_visible_hidden_wins_over_pinned() {
+        let mut entries = BTreeMap::new();
+        entries.insert("a".to_string(), entry("a", "Alpha"));
+        let cfg = AppsConfig {
+            pinned: vec!["a".to_string()],
+            hidden: vec!["a".to_string()],
+            ..Default::default()
+        };
+        assert!(build_visible(&entries, &cfg).is_empty());
+    }
+
+    #[test]
+    fn build_visible_no_display_filtered() {
+        let mut entries = BTreeMap::new();
+        let mut hidden_e = entry("hidden", "Hidden App");
+        hidden_e.no_display = true;
+        entries.insert("hidden".to_string(), hidden_e);
+        entries.insert("shown".to_string(), entry("shown", "Shown App"));
+        let visible = build_visible(&entries, &AppsConfig::default());
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "shown");
+    }
+
+    #[test]
+    fn build_visible_override_name() {
+        let mut entries = BTreeMap::new();
+        entries.insert("a".to_string(), entry("a", "Original"));
+        let mut overrides = BTreeMap::new();
+        overrides.insert("a".to_string(), AppOverride {
+            display_name: Some("Overridden".to_string()),
+            icon: None,
+        });
+        let cfg = AppsConfig {
+            overrides,
+            ..Default::default()
+        };
+        let visible = build_visible(&entries, &cfg);
+        assert_eq!(visible[0].name, "Overridden");
+    }
+
+    #[test]
+    fn build_visible_pinned_surfaces_nodisplay() {
+        let mut entries = BTreeMap::new();
+        let mut hidden_e = entry("a", "Alpha");
+        hidden_e.no_display = true;
+        entries.insert("a".to_string(), hidden_e);
+        let cfg = AppsConfig {
+            pinned: vec!["a".to_string()],
+            ..Default::default()
+        };
+        let visible = build_visible(&entries, &cfg);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "a");
+    }
+
+    #[test]
+    fn build_visible_pinned_unknown_id_ignored() {
+        let mut entries = BTreeMap::new();
+        entries.insert("a".to_string(), entry("a", "Alpha"));
+        let cfg = AppsConfig {
+            pinned: vec!["nonexistent".to_string()],
+            ..Default::default()
+        };
+        let visible = build_visible(&entries, &cfg);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, "a");
+    }
+}

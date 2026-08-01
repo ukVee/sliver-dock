@@ -14,11 +14,12 @@ use gtk4::cairo::Context as CairoContext;
 use gtk4::gdk;
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Application, ApplicationWindow, Calendar, CssProvider, DrawingArea, GestureClick, Label,
-    Popover,
+    glib, Application, ApplicationWindow, Calendar, CssProvider, DrawingArea, GestureClick,
+    Label, Popover,
 };
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
+use crate::app_grid;
 use crate::apps::{self, AppEntry};
 use crate::battery::{self, BatteryInfo, BatteryState};
 use crate::config::{self, Animation, Geometry};
@@ -70,12 +71,14 @@ fn on_activate(app: &Application) {
         area.clone(),
     );
     load_apps_into(&drag);
+    drag.load_launches();
 
     let geom = cfg.geometry;
     let anim = cfg.animation;
     let drag_for_draw = Rc::clone(&drag);
     area.set_draw_func(move |_, ctx, w, h| {
         draw_bar(ctx, w as f64, h as f64, &geom, &anim, &drag_for_draw);
+        draw_app_grid_overlay(ctx, w as f64, h as f64, &geom, &drag_for_draw);
     });
 
     let popovers = build_info_popovers(&area);
@@ -95,7 +98,11 @@ fn on_activate(app: &Application) {
         let s = drag_for_map.state();
         zones::set_enabled(drag::BOTTOM_EDGE_ZONE_ID, matches!(s, BarState::Hidden));
         zones::set_enabled(drag::BAR_ZONE_ID, matches!(s, BarState::Closed));
-        zones::set_enabled(drag::DETAILED_ZONE_ID, matches!(s, BarState::Detailed));
+        zones::set_enabled(drag::DETAILED_ZONE_ID, false);
+        zones::set_enabled(
+            drag::SLIVER_EDGE_ZONE_ID,
+            matches!(s, BarState::Closed | BarState::Detailed | BarState::AppGrid),
+        );
         drag_for_map.refresh_input_region();
     });
 
@@ -194,7 +201,8 @@ fn apply_command(req: &mut ipc::Request, drag: &Rc<Drag>, app: &Application) {
         "drag-begin" => match tokens.next() {
             Some("up") => drag.begin(Direction::Up),
             Some("down") => drag.begin(Direction::Down),
-            other => eprintln!("sliver-dock: drag-begin expects up|down, got {:?}", other),
+            Some("up-grid") => drag.begin(Direction::UpGrid),
+            other => eprintln!("sliver-dock: drag-begin expects up|down|up-grid, got {:?}", other),
         },
         "drag" => {
             if let Some(p) = tokens.next().and_then(|s| s.parse::<f64>().ok()) {
@@ -240,7 +248,8 @@ fn load_apps_into(drag: &Rc<Drag>) {
 
 fn build_window(app: &Application, cfg: &config::Config) -> (ApplicationWindow, DrawingArea) {
     let g = cfg.geometry;
-    let window_height = g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px;
+    let window_height =
+        g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px + g.grid_height_px;
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -323,6 +332,83 @@ fn draw_bar(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, a: &Animation, dra
         slope,
     );
     let _ = ctx.fill();
+
+    if v.hidden_amount < 0.999 {
+        draw_sliver_bar(ctx, bar_left, bar_w, bar_h, bar_top, slope, alpha);
+    }
+}
+
+fn draw_sliver_bar(ctx: &CairoContext, x: f64, w: f64, bar_h: f64, main_bar_top: f64, slope: f64, alpha: f64) {
+    let sliver_top = main_bar_top - bar_h;
+    let sliver_bot = main_bar_top;
+    let (left_tip, left_inner, right_inner, right_tip, off_x, off_y) = spear_geom(x, w, bar_h, slope);
+    let mid_y = (sliver_top + sliver_bot) / 2.0;
+
+    ctx.set_source_rgba(0.05, 0.05, 0.05, alpha);
+
+    ctx.move_to(left_inner, sliver_top);
+    ctx.line_to(right_inner, sliver_top);
+    ctx.curve_to(right_inner + off_x, sliver_top, right_tip, mid_y - off_y, right_tip, mid_y);
+    ctx.curve_to(right_tip, mid_y + off_y, right_inner + off_x, sliver_bot, right_inner, sliver_bot);
+    ctx.line_to(left_inner, sliver_bot);
+    ctx.curve_to(left_inner - off_x, sliver_bot, left_tip, mid_y + off_y, left_tip, mid_y);
+    ctx.curve_to(left_tip, mid_y - off_y, left_inner - off_x, sliver_top, left_inner, sliver_top);
+    ctx.close_path();
+    let _ = ctx.fill();
+}
+
+/// The app grid is a solid, bordered card that extrudes *up* from the
+/// launcher (the pinned apps section). The radial rings sit at a fixed
+/// centre — no panning, no per-icon zoom — and the open/close animation is a
+/// clip that grows the card upward from `apps_top` as `grid_amount` goes
+/// 0 → 1. Because it runs after `draw_bar`, it composites on top of the
+/// already-painted sections; the card fill covers only the grid area *above*
+/// the launcher, so the pinned icons stay visible inside the frame.
+fn draw_app_grid_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &Drag) {
+    let v = drag.visual();
+    let a = v.grid_amount;
+    if a < 0.001 {
+        return;
+    }
+    let Some(state) = drag.grid_state() else { return };
+
+    let bar_w = (g.width_px as f64).min(w);
+    let bar_h = g.default_height_px as f64;
+    let bar_left = (w - bar_w) / 2.0;
+    let bar_bot_y = h - g.margin_bottom_px as f64;
+    let bar_top_y = bar_bot_y - bar_h;
+    let sliver_top = bar_top_y - bar_h;
+    let tip_len = bar_h * 6.0;
+    let grid_h = g.grid_height_px as f64;
+    let grid_w = (bar_w - 2.0 * tip_len).max(0.0);
+    let grid_x = bar_left + tip_len;
+
+    let center_x = bar_left + bar_w / 2.0;
+    let center_y = sliver_top - grid_h / 2.0;
+    let panel_top = sliver_top - grid_h * a;
+    let card_h = (sliver_top - panel_top).max(0.0);
+    let corner = 12.0;
+
+    let bg_r = 0.161;
+    let bg_g = 0.180;
+    let bg_b = 0.259;
+
+    ctx.save().ok();
+    rounded_rect_path(ctx, grid_x, panel_top, grid_w, card_h, corner);
+    ctx.clip();
+
+    if card_h > 0.0 {
+        ctx.set_source_rgba(bg_r, bg_g, bg_b, 0.40 * a);
+        ctx.rectangle(grid_x, panel_top, grid_w, card_h);
+        let _ = ctx.fill();
+    }
+
+    let icon_loader = |id: &str, spec: Option<&str>| -> Option<(cairo::ImageSurface, f64)> {
+        let s = drag.app_icon(id, spec, 41)?;
+        Some((s, 41.0))
+    };
+    app_grid::draw_grid(ctx, &state, center_x, center_y, a, &icon_loader);
+    ctx.restore().ok();
 }
 
 /// Three placeholder section blocks staggered in detailed_amount space.
@@ -1015,13 +1101,15 @@ struct SectionLayout {
 /// Re-derive the section slot geometry inside the bar. Mirrors the layout
 /// math in `draw_sections` so click hit-testing matches what was painted
 /// without coupling to whether the draw callback has run.
-fn section_bounds(surface_w: f64, g: &Geometry) -> SectionLayout {
+fn section_bounds(surface_w: f64, surface_h: f64, g: &Geometry) -> SectionLayout {
     let bar_w = (g.width_px as f64).min(surface_w);
     let bar_left = (surface_w - bar_w) / 2.0;
     let mid_gap = 6.0;
     let main_w = ((bar_w - INFO_SECTION_W - 2.0 * mid_gap) / 2.0).max(0.0);
-    let win_h = (g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px) as f64;
-    let bar_bot_y = win_h - g.margin_bottom_px as f64;
+    // `surface_h` is the real (grid-inflated) surface height; the bar is
+    // bottom-anchored within it, so the cut line is measured up from the
+    // bottom edge — never from a `margin+default+detailed` constant.
+    let bar_bot_y = surface_h - g.margin_bottom_px as f64;
     let bar_top_y = bar_bot_y - g.default_height_px as f64;
     let cut_y = (bar_top_y + bar_bot_y) / 2.0;
     let info_x = bar_left + bar_w - INFO_SECTION_W;
@@ -1162,14 +1250,43 @@ fn install_section_click_handler(
     let drag = Rc::clone(drag);
     let area_for_size = area.clone();
     gesture.connect_pressed(move |_, _n_press, x, y| {
-        if drag.state() != BarState::Detailed {
+        let bar_state = drag.state();
+        if bar_state != BarState::Detailed && bar_state != BarState::AppGrid {
             return;
         }
         let surface_w = area_for_size.width() as f64;
+        // Real surface height (== the layer-shell surface, `grid_height_px`
+        // taller than the pre-grid window). All vertical hit-test geometry
+        // must key off this, not a `margin+default+detailed` constant, or the
+        // hit targets land `grid_height_px` above the drawn content.
+        let surface_h = area_for_size.height() as f64;
+
+        if bar_state == BarState::AppGrid {
+            if let Some(state) = drag.grid_state() {
+                let bar_w = (geom.width_px as f64).min(surface_w);
+                let bar_left = (surface_w - bar_w) / 2.0;
+                let center_x = bar_left + bar_w / 2.0;
+                let bar_bot_y = surface_h - geom.margin_bottom_px as f64;
+                let bar_top_y = bar_bot_y - geom.default_height_px as f64;
+                let sliver_top = bar_top_y - geom.default_height_px as f64;
+                let center_y = sliver_top - geom.grid_height_px as f64 / 2.0;
+                if let Some(entry) =
+                    app_grid::hit_test(x, y, &state, center_x, center_y, 1.0)
+                {
+                    handle_app_tap(&drag, &entry);
+                    if drag.auto_close_app_grid() {
+                        drag.snap_to_state(BarState::Detailed);
+                    }
+                    return;
+                }
+            }
+            return;
+        }
+
         if surface_w <= 0.0 {
             return;
         }
-        let layout = section_bounds(surface_w, &geom);
+        let layout = section_bounds(surface_w, surface_h, &geom);
         let max_h = geom.detailed_content_height_px as f64;
 
         let apps_snapshot = drag.visible_apps();
@@ -1260,7 +1377,10 @@ fn handle_app_tap(drag: &Rc<Drag>, entry: &AppEntry) {
 
     let cmdline = apps::strip_exec_field_codes(exec);
     match glib::spawn_command_line_async(&cmdline) {
-        Ok(()) => drag.mark_launching(&entry.id),
+            Ok(()) => {
+                drag.mark_launching(&entry.id);
+                drag.increment_launch_count(&entry.id);
+            }
         Err(e) => eprintln!("sliver-dock: spawn {cmdline:?}: {e}"),
     }
 }
@@ -1333,6 +1453,7 @@ fn handle_terminal_tap(drag: &Rc<Drag>) {
     }
     if any_spawn {
         drag.mark_launching(term_id);
+        drag.increment_launch_count(term_id);
     }
 }
 
@@ -1590,6 +1711,24 @@ fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
         matches!(initial, BarState::Detailed),
         Some(dh),
     );
+
+    // Sliver-edge bidir zone — 15px strip above the sliver bar. Up triggers
+    // the app-grid (UpGrid direction); down is a no-op in this zone. Uses
+    // travel_px=15 so a short swipe saturates progress. Enabled in Closed,
+    // Detailed, and AppGrid states.
+    let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom);
+    zones::register_bidir(
+        drag::SLIVER_EDGE_ZONE_ID,
+        sx,
+        sy,
+        sw_z,
+        sh_z,
+        &reply,
+        "up-grid",
+        "down",
+        matches!(initial, BarState::Closed | BarState::Detailed | BarState::AppGrid),
+        Some(sh_z),
+    );
 }
 
 fn update_zone_bounds(geom: &Geometry) {
@@ -1605,6 +1744,8 @@ fn update_zone_bounds(geom: &Geometry) {
     zones::update_bounds(drag::BAR_ZONE_ID, bx, by, bw, bh);
     let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, geom);
     zones::update_bounds(drag::DETAILED_ZONE_ID, dx, dy, dw, dh);
+    let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom);
+    zones::update_bounds(drag::SLIVER_EDGE_ZONE_ID, sx, sy, sw_z, sh_z);
 }
 
 /// Bar zone covers the bar plus the margin band beneath it, centered on
@@ -1626,6 +1767,15 @@ fn detailed_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i3
     let x = (sw - bar_w) / 2;
     let y = sh - h;
     (x, y, bar_w, h)
+}
+
+/// Sliver-edge zone — 15px strip immediately above the sliver bar. Full
+/// bar width, centered horizontally. Y = sliver_top - 15.
+fn sliver_edge_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i32) {
+    let bar_w = geom.width_px.min(sw);
+    let x = (sw - bar_w) / 2;
+    let y = sh - geom.margin_bottom_px - geom.default_height_px * 2 - 15;
+    (x, y, bar_w, 15)
 }
 
 /// 1Hz redraw loop for the clock. Always running — `queue_draw` is cheap
@@ -1656,4 +1806,198 @@ fn watch_monitor_changes(geom: Geometry) {
 #[allow(dead_code)]
 fn _visibility_guard() -> Rc<Cell<bool>> {
     Rc::new(Cell::new(true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::WorkspaceId;
+    use std::collections::HashSet;
+
+    #[test]
+    fn montage_cells_0_empty() {
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        assert!(montage_cells(rect, 0).is_empty());
+    }
+
+    #[test]
+    fn montage_cells_1_full() {
+        let rect = Rect { x: 10.0, y: 20.0, w: 100.0, h: 100.0 };
+        let cells = montage_cells(rect, 1);
+        assert_eq!(cells.len(), 1);
+        assert!((cells[0].x - 10.0).abs() < 1e-9);
+        assert!((cells[0].y - 20.0).abs() < 1e-9);
+        assert!((cells[0].w - 100.0).abs() < 1e-9);
+        assert!((cells[0].h - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn montage_cells_2_vertical_split() {
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let cells = montage_cells(rect, 2);
+        assert_eq!(cells.len(), 2);
+        assert!(cells[0].x < cells[1].x);
+        assert_eq!(cells[0].h, cells[1].h);
+    }
+
+    #[test]
+    fn montage_cells_3_triangular() {
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let cells = montage_cells(rect, 3);
+        assert_eq!(cells.len(), 3);
+        assert_eq!(cells[2].w, rect.w);
+    }
+
+    #[test]
+    fn montage_cells_4_grid() {
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let cells = montage_cells(rect, 4);
+        assert_eq!(cells.len(), 4);
+    }
+
+    #[test]
+    fn montage_cells_5_truncated_to_4() {
+        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let cells = montage_cells(rect, 5);
+        assert_eq!(cells.len(), 4);
+    }
+
+    #[test]
+    fn first_free_workspace_2x2_empty() {
+        let grid = GridSize { width: 2, height: 2 };
+        let opened = HashSet::new();
+        let free = first_free_workspace(grid, &opened);
+        assert_eq!(free, Some(WorkspaceId { x: 0, y: 0 }));
+    }
+
+    #[test]
+    fn first_free_workspace_skips_opened() {
+        let grid = GridSize { width: 2, height: 2 };
+        let mut opened = HashSet::new();
+        opened.insert(WorkspaceId { x: 0, y: 0 });
+        let free = first_free_workspace(grid, &opened);
+        assert_eq!(free, Some(WorkspaceId { x: 1, y: 0 }));
+    }
+
+    #[test]
+    fn first_free_workspace_all_full() {
+        let grid = GridSize { width: 2, height: 2 };
+        let mut opened = HashSet::new();
+        for x in 0..2 {
+            for y in 0..2 {
+                opened.insert(WorkspaceId { x, y });
+            }
+        }
+        assert_eq!(first_free_workspace(grid, &opened), None);
+    }
+
+    #[test]
+    fn terminal_layout_slots_counts() {
+        assert_eq!(terminal_layout_slots(1, (800, 480)).len(), 1);
+        assert_eq!(terminal_layout_slots(2, (800, 480)).len(), 2);
+        assert_eq!(terminal_layout_slots(3, (800, 480)).len(), 3);
+        assert_eq!(terminal_layout_slots(4, (800, 480)).len(), 4);
+    }
+
+    #[test]
+    fn terminal_layout_slots_single_fullscreen() {
+        let slots = terminal_layout_slots(1, (800, 480));
+        assert_eq!(slots[0], (0, 0, 800, 480));
+    }
+
+    #[test]
+    fn terminal_layout_slots_bad_output() {
+        assert!(terminal_layout_slots(1, (0, 0)).is_empty());
+        assert!(terminal_layout_slots(1, (-1, 480)).is_empty());
+    }
+
+    #[test]
+    fn ordinal_suffix_basics() {
+        assert_eq!(ordinal_suffix(1), "st");
+        assert_eq!(ordinal_suffix(2), "nd");
+        assert_eq!(ordinal_suffix(3), "rd");
+        assert_eq!(ordinal_suffix(4), "th");
+        assert_eq!(ordinal_suffix(21), "st");
+        assert_eq!(ordinal_suffix(22), "nd");
+        assert_eq!(ordinal_suffix(23), "rd");
+    }
+
+    #[test]
+    fn ordinal_suffix_teens() {
+        assert_eq!(ordinal_suffix(11), "th");
+        assert_eq!(ordinal_suffix(12), "th");
+        assert_eq!(ordinal_suffix(13), "th");
+    }
+
+    #[test]
+    fn weekday_abbrevs() {
+        assert_eq!(weekday_abbrev(time::Weekday::Monday), "Mon");
+        assert_eq!(weekday_abbrev(time::Weekday::Friday), "Fri");
+        assert_eq!(weekday_abbrev(time::Weekday::Sunday), "Sun");
+    }
+
+    #[test]
+    fn spear_geom_values() {
+        let (left_tip, left_inner, right_inner, right_tip, off_x, off_y) =
+            spear_geom(0.0, 900.0, 6.0, 0.35);
+        assert!((left_tip - 0.0).abs() < 1e-9);
+        assert!((left_inner - 36.0).abs() < 1e-9);
+        assert!((right_inner - 864.0).abs() < 1e-9);
+        assert!((right_tip - 900.0).abs() < 1e-9);
+        assert!((off_x - 12.6).abs() < 1e-9);
+        assert!((off_y - 1.05).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rect_contains_inside() {
+        let r = Rect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 };
+        assert!(rect_contains(&r, 10.0, 20.0));
+        assert!(rect_contains(&r, 39.9, 59.9));
+        assert!(rect_contains(&r, 25.0, 40.0));
+    }
+
+    #[test]
+    fn rect_contains_outside() {
+        let r = Rect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 };
+        assert!(!rect_contains(&r, 9.9, 20.0));
+        assert!(!rect_contains(&r, 10.0, 19.9));
+        assert!(!rect_contains(&r, 40.0, 20.0));
+        assert!(!rect_contains(&r, 10.0, 60.0));
+    }
+
+    #[test]
+    fn cpu_fill_color_ranges() {
+        let (_r, g1, _b) = cpu_fill_color(30);
+        assert!(g1 > 0.6);
+
+        let (r60, _g, _b) = cpu_fill_color(60);
+        assert!(r60 > 0.6);
+
+        let (r90, _g, _b) = cpu_fill_color(90);
+        assert!(r90 > 0.9);
+    }
+
+    #[test]
+    fn battery_fill_color_charging() {
+        let (_r, g, _b) = battery_fill_color(BatteryState::Charging, 80);
+        assert!(g > 0.7);
+    }
+
+    #[test]
+    fn battery_fill_color_low() {
+        let (r, _g, _b) = battery_fill_color(BatteryState::Discharging, 10);
+        assert!(r > 0.9);
+    }
+
+    #[test]
+    fn row_layout_fits_all() {
+        let rects = row_layout(0.0, 200.0, 200.0, 66.0, 3, 0.0);
+        assert_eq!(rects.len(), 3);
+    }
+
+    #[test]
+    fn row_layout_empty() {
+        let rects = row_layout(0.0, 200.0, 200.0, 66.0, 0, 0.0);
+        assert!(rects.is_empty());
+    }
 }

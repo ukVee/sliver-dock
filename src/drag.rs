@@ -13,7 +13,7 @@
 //! All methods run on the GTK main thread.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -22,8 +22,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{ApplicationWindow, DrawingArea};
 
-use std::collections::VecDeque;
-
+use crate::app_grid;
 use crate::apps::{self, AppEntry};
 use crate::battery::BatteryInfo;
 use crate::config::{Animation, Behaviour, Geometry, Terminal};
@@ -35,6 +34,7 @@ use crate::zones;
 pub const BOTTOM_EDGE_ZONE_ID: &str = "sliver-dock.bottom-edge";
 pub const BAR_ZONE_ID: &str = "sliver-dock.bar-closed";
 pub const DETAILED_ZONE_ID: &str = "sliver-dock.detailed";
+pub const SLIVER_EDGE_ZONE_ID: &str = "sliver-dock.sliver-edge";
 
 /// Drop a tapped-but-unmapped app off the launching set after this long —
 /// safety net so a failed launch (no view ever maps) doesn't spin forever.
@@ -50,6 +50,7 @@ const LAUNCH_SPINNER_TICK_MS: u64 = 33;
 pub enum Direction {
     Up,
     Down,
+    UpGrid,
 }
 
 /// Continuous render parameters derived from steady state ± in-flight drag.
@@ -60,6 +61,7 @@ pub enum Direction {
 pub struct Visual {
     pub hidden_amount: f64,
     pub detailed_amount: f64,
+    pub grid_amount: f64,
 }
 
 impl From<BarState> for Visual {
@@ -68,14 +70,22 @@ impl From<BarState> for Visual {
             BarState::Closed => Visual {
                 hidden_amount: 0.0,
                 detailed_amount: 0.0,
+                grid_amount: 0.0,
             },
             BarState::Hidden => Visual {
                 hidden_amount: 1.0,
                 detailed_amount: 0.0,
+                grid_amount: 0.0,
             },
             BarState::Detailed => Visual {
                 hidden_amount: 0.0,
                 detailed_amount: 1.0,
+                grid_amount: 0.0,
+            },
+            BarState::AppGrid => Visual {
+                hidden_amount: 0.0,
+                detailed_amount: 1.0,
+                grid_amount: 1.0,
             },
         }
     }
@@ -184,6 +194,8 @@ pub struct Drag {
     /// animation tick is live; reset to `None` when launching drains.
     launching_started_at: Cell<Option<Instant>>,
     launching_animation: RefCell<Option<glib::SourceId>>,
+    launch_counts: RefCell<HashMap<String, u64>>,
+    grid_state: RefCell<Option<app_grid::GridState>>,
 }
 
 impl Drag {
@@ -226,6 +238,8 @@ impl Drag {
             launching: RefCell::new(HashMap::new()),
             launching_started_at: Cell::new(None),
             launching_animation: RefCell::new(None),
+            launch_counts: RefCell::new(HashMap::new()),
+            grid_state: RefCell::new(None),
         })
     }
 
@@ -511,14 +525,19 @@ impl Drag {
             .collect();
         entries.sort();
         format!(
-            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3}}},"workspace":{{"x":{},"y":{}}},"map":[{}]}}"#,
+            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"workspace":{{"x":{},"y":{}}},"map":[{}]}}"#,
             self.state.get().as_str(),
             v.hidden_amount,
             v.detailed_amount,
+            v.grid_amount,
             ws.x,
             ws.y,
             entries.join(",")
         )
+    }
+
+    pub fn auto_close_app_grid(&self) -> bool {
+        self.behaviour.auto_close_app_grid
     }
 
     fn cancel_animation(&self) {
@@ -543,6 +562,9 @@ impl Drag {
         self.set_visual(target.into());
         self.save_current_workspace();
         self.apply_visibility();
+        if target == BarState::AppGrid {
+            self.rebuild_grid();
+        }
         update_zone_states(target);
         self.refresh_input_region();
     }
@@ -584,16 +606,25 @@ impl Drag {
     pub fn refresh_input_region(&self) {
         let Some(surface) = self.window.surface() else { return };
         let win_w = surface.width();
-        if win_w <= 0 {
+        let win_h = surface.height();
+        if win_w <= 0 || win_h <= 0 {
             return;
         }
         let g = &self.geom;
         let bar_w = g.width_px.min(win_w);
-        let win_h = g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px;
+        // `win_h` is the real surface height — `grid_height_px` taller than
+        // the pre-grid window. The bar is bottom-anchored, so the input
+        // region is measured up from the bottom edge. Using the old
+        // `margin+default+detailed` constant here pinned the region to the
+        // top `~107px` of a 507px surface, leaving the visible bar unclickable.
         let bar_top = win_h - g.margin_bottom_px - g.default_height_px;
 
         let extend_up = if self.input_should_be_expanded() {
-            g.detailed_content_height_px
+            if self.grid_expand_needed() {
+                g.default_height_px + g.grid_height_px
+            } else {
+                g.detailed_content_height_px
+            }
         } else {
             0
         };
@@ -612,10 +643,18 @@ impl Drag {
     /// clicks land while the gap is animating, not just after settle.
     fn input_should_be_expanded(&self) -> bool {
         if let Some(s) = self.session.get() {
-            return matches!(s.source, BarState::Detailed)
-                || matches!(s.target, BarState::Detailed);
+            return matches!(s.source, BarState::Detailed | BarState::AppGrid)
+                || matches!(s.target, BarState::Detailed | BarState::AppGrid);
         }
-        matches!(self.state.get(), BarState::Detailed)
+        matches!(self.state.get(), BarState::Detailed | BarState::AppGrid)
+    }
+
+    fn grid_expand_needed(&self) -> bool {
+        if let Some(s) = self.session.get() {
+            return matches!(s.source, BarState::AppGrid)
+                || matches!(s.target, BarState::AppGrid);
+        }
+        matches!(self.state.get(), BarState::AppGrid)
     }
 
     #[allow(dead_code)] // Phase 3+: instant-set without animation
@@ -626,6 +665,9 @@ impl Drag {
         self.state.set(target);
         self.set_visual(target.into());
         self.save_current_workspace();
+        if target == BarState::AppGrid {
+            self.rebuild_grid();
+        }
         self.apply_visibility();
         update_zone_states(target);
         self.refresh_input_region();
@@ -652,6 +694,45 @@ impl Drag {
             .copied()
             .unwrap_or(BarState::Detailed);
         self.snap_to_state(target);
+    }
+
+    pub fn load_launches(&self) {
+        let counts = app_grid::load_launches();
+        *self.launch_counts.borrow_mut() = counts;
+    }
+
+    pub fn increment_launch_count(&self, id: &str) {
+        {
+            let mut counts = self.launch_counts.borrow_mut();
+            *counts.entry(id.to_owned()).or_insert(0) += 1;
+        }
+        if let Err(e) = app_grid::save_launches(&self.launch_counts.borrow()) {
+            eprintln!("sliver-dock: failed to save launches: {e}");
+        }
+    }
+
+    pub fn rebuild_grid(&self) {
+        let registry = self.app_registry.borrow();
+        let counts = self.launch_counts.borrow();
+        if registry.is_empty() {
+            return;
+        }
+        let entries_map: BTreeMap<String, AppEntry> = registry.clone().into_iter().collect();
+        let g = &self.geom;
+        let bar_w = g.width_px as f64;
+        let tip_len = g.default_height_px as f64 * 6.0;
+        let grid_w = (bar_w - 2.0 * tip_len).max(0.0);
+        let state = app_grid::build_grid(
+            &entries_map,
+            &counts,
+            grid_w,
+            g.grid_height_px as f64,
+        );
+        *self.grid_state.borrow_mut() = Some(state);
+    }
+
+    pub fn grid_state(&self) -> Option<app_grid::GridState> {
+        self.grid_state.borrow().clone()
     }
 
     /// Apply the latest fullscreen-workspace set from Wayfire. No-op when
@@ -725,6 +806,7 @@ impl Drag {
         self.ensure_mapped();
         if (from.hidden_amount - to.hidden_amount).abs() < 1e-6
             && (from.detailed_amount - to.detailed_amount).abs() < 1e-6
+            && (from.grid_amount - to.grid_amount).abs() < 1e-6
         {
             self.settle(target);
             return;
@@ -738,6 +820,7 @@ impl Drag {
             let v = Visual {
                 hidden_amount: lerp(from.hidden_amount, to.hidden_amount, eased),
                 detailed_amount: lerp(from.detailed_amount, to.detailed_amount, eased),
+                grid_amount: lerp(from.grid_amount, to.grid_amount, eased),
             };
             this.set_visual(v);
             if t >= 1.0 {
@@ -756,8 +839,12 @@ impl Drag {
         let target = match (source, direction) {
             (BarState::Closed, Direction::Up) => BarState::Detailed,
             (BarState::Closed, Direction::Down) => BarState::Hidden,
+            (BarState::Closed, Direction::UpGrid) => BarState::AppGrid,
             (BarState::Detailed, Direction::Down) => BarState::Closed,
+            (BarState::Detailed, Direction::Up) => BarState::AppGrid,
+            (BarState::Detailed, Direction::UpGrid) => BarState::AppGrid,
             (BarState::Hidden, Direction::Up) => BarState::Closed,
+            (BarState::AppGrid, Direction::Down) => BarState::Detailed,
             _ => return,
         };
         self.cancel_animation();
@@ -767,6 +854,9 @@ impl Drag {
             direction,
         }));
         self.ensure_mapped();
+        if target == BarState::AppGrid {
+            self.rebuild_grid();
+        }
         self.set_visual(Visual::from(source));
         self.refresh_input_region();
     }
@@ -779,6 +869,7 @@ impl Drag {
         let v = Visual {
             hidden_amount: lerp(from.hidden_amount, to.hidden_amount, p),
             detailed_amount: lerp(from.detailed_amount, to.detailed_amount, p),
+            grid_amount: lerp(from.grid_amount, to.grid_amount, p),
         };
         self.set_visual(v);
     }
@@ -820,7 +911,7 @@ fn forward_progress(dir: Direction, p: f64) -> f64 {
     let p = p.clamp(0.0, 1.0);
     match dir {
         Direction::Down => p,
-        Direction::Up => 1.0 - p,
+        Direction::Up | Direction::UpGrid => 1.0 - p,
     }
 }
 
@@ -831,7 +922,7 @@ fn forward_progress(dir: Direction, p: f64) -> f64 {
 fn forward_velocity(dir: Direction, v: f64) -> f64 {
     match dir {
         Direction::Down => v,
-        Direction::Up => -v,
+        Direction::Up | Direction::UpGrid => -v,
     }
 }
 
@@ -849,5 +940,74 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 fn update_zone_states(state: BarState) {
     zones::set_enabled(BAR_ZONE_ID, matches!(state, BarState::Closed));
     zones::set_enabled(BOTTOM_EDGE_ZONE_ID, matches!(state, BarState::Hidden));
-    zones::set_enabled(DETAILED_ZONE_ID, matches!(state, BarState::Detailed));
+    zones::set_enabled(DETAILED_ZONE_ID, false);
+    zones::set_enabled(
+        SLIVER_EDGE_ZONE_ID,
+        matches!(state, BarState::Closed | BarState::Detailed | BarState::AppGrid),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forward_progress_down_unchanged() {
+        assert!((forward_progress(Direction::Down, 0.0) - 0.0).abs() < 1e-9);
+        assert!((forward_progress(Direction::Down, 0.5) - 0.5).abs() < 1e-9);
+        assert!((forward_progress(Direction::Down, 1.0) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forward_progress_up_inverted() {
+        assert!((forward_progress(Direction::Up, 0.0) - 1.0).abs() < 1e-9);
+        assert!((forward_progress(Direction::Up, 0.5) - 0.5).abs() < 1e-9);
+        assert!((forward_progress(Direction::Up, 1.0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forward_progress_up_grid_inverted() {
+        assert!((forward_progress(Direction::UpGrid, 0.0) - 1.0).abs() < 1e-9);
+        assert!((forward_progress(Direction::UpGrid, 0.5) - 0.5).abs() < 1e-9);
+        assert!((forward_progress(Direction::UpGrid, 1.0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forward_progress_clamped() {
+        assert!((forward_progress(Direction::Down, -0.5) - 0.0).abs() < 1e-9);
+        assert!((forward_progress(Direction::Down, 1.5) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forward_velocity_down_unchanged() {
+        assert!((forward_velocity(Direction::Down, 10.0) - 10.0).abs() < 1e-9);
+        assert!((forward_velocity(Direction::Down, -3.0) - (-3.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forward_velocity_up_negated() {
+        assert!((forward_velocity(Direction::Up, 10.0) - (-10.0)).abs() < 1e-9);
+        assert!((forward_velocity(Direction::Up, -3.0) - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn forward_velocity_up_grid_negated() {
+        assert!((forward_velocity(Direction::UpGrid, 5.0) - (-5.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn lerp_boundaries() {
+        assert!((lerp(0.0, 10.0, 0.0) - 0.0).abs() < 1e-9);
+        assert!((lerp(0.0, 10.0, 1.0) - 10.0).abs() < 1e-9);
+        assert!((lerp(0.0, 10.0, 0.5) - 5.0).abs() < 1e-9);
+        assert!((lerp(5.0, 15.0, 0.25) - 7.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn direction_equality() {
+        assert_eq!(Direction::Up, Direction::Up);
+        assert_ne!(Direction::Up, Direction::Down);
+        assert_ne!(Direction::Up, Direction::UpGrid);
+        assert_ne!(Direction::Down, Direction::UpGrid);
+    }
 }

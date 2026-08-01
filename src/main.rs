@@ -3,6 +3,7 @@
 //! No args  → run as daemon (GTK main loop + layer-shell window + IPC server).
 //! One verb → send the verb to the running daemon and exit.
 
+mod app_grid;
 mod apps;
 mod battery;
 mod config;

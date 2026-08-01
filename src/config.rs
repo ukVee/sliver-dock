@@ -25,6 +25,7 @@ pub struct Geometry {
     pub default_height_px: i32,
     pub detailed_content_height_px: i32,
     pub taper_slope: f64,
+    pub grid_height_px: i32,
 }
 
 impl Default for Geometry {
@@ -35,6 +36,7 @@ impl Default for Geometry {
             default_height_px: 6,
             detailed_content_height_px: 66,
             taper_slope: 0.35,
+            grid_height_px: 400,
         }
     }
 }
@@ -86,6 +88,7 @@ impl Default for Terminal {
 pub struct Behaviour {
     pub hide_when_fullscreen: bool,
     pub remember_per_workspace: bool,
+    pub auto_close_app_grid: bool,
 }
 
 impl Default for Behaviour {
@@ -93,6 +96,7 @@ impl Default for Behaviour {
         Self {
             hide_when_fullscreen: true,
             remember_per_workspace: true,
+            auto_close_app_grid: true,
         }
     }
 }
