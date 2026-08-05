@@ -248,8 +248,16 @@ fn load_apps_into(drag: &Rc<Drag>) {
 
 fn build_window(app: &Application, cfg: &config::Config) -> (ApplicationWindow, DrawingArea) {
     let g = cfg.geometry;
-    let window_height =
-        g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px + g.grid_height_px;
+    // Astro view: the surface fills the screen minus a `D`-tall band at top
+    // and bottom (`D` = the dock's own detailed stack height), so the astro
+    // rect can span screen `[D, h-D]`. Sized off the real monitor height;
+    // falls back to the old grid-inflated formula only if monitor 0 can't be
+    // read at startup. Bottom-anchored, so the extra height grows *upward*.
+    let dock_stack = dock_stack_px(&g);
+    let window_height = match current_screen_size() {
+        Some((_, sh)) => (sh - dock_stack).max(dock_stack + g.grid_height_px),
+        None => dock_stack + g.grid_height_px,
+    };
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -357,13 +365,52 @@ fn draw_sliver_bar(ctx: &CairoContext, x: f64, w: f64, bar_h: f64, main_bar_top:
     let _ = ctx.fill();
 }
 
-/// The app grid is a solid, bordered card that extrudes *up* from the
-/// launcher (the pinned apps section). The radial rings sit at a fixed
-/// centre — no panning, no per-icon zoom — and the open/close animation is a
-/// clip that grows the card upward from `apps_top` as `grid_amount` goes
-/// 0 → 1. Because it runs after `draw_bar`, it composites on top of the
-/// already-painted sections; the card fill covers only the grid area *above*
-/// the launcher, so the pinned icons stay visible inside the frame.
+/// The dock's own vertical footprint from the screen bottom in the Detailed
+/// state — `margin + the 6px bar + the detailed content`. This is `D` in the
+/// astro spec (note 010): the surface is sized `screen_h - D` tall and the
+/// astro rect spans screen `[D, h-D]`, leaving an even `D`-tall band above
+/// and below.
+fn dock_stack_px(g: &Geometry) -> i32 {
+    g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px
+}
+
+/// The astro-view rectangle in **surface** coordinates (`y = 0` at the surface
+/// top). It fills the whole surface above the dock's detailed stack, indented
+/// on each side to the sliver-tip x-extent (`tip_len = default_height · 6`).
+/// In screen space this is `[D, h-D]`; here — because the surface is
+/// bottom-anchored and `screen_h - D` tall — it is `[0, surface_h - D]`.
+///
+/// All astro geometry keys off the **real** surface height passed to the draw
+/// callback / hit-test, never a `margin+default+detailed(+grid)` constant, per
+/// `incident-20260801-app-grid-invisible-stale-surface-height`.
+struct AstroRect {
+    x: f64,
+    top: f64,
+    w: f64,
+    bottom: f64,
+}
+
+fn astro_rect(surface_w: f64, surface_h: f64, g: &Geometry) -> AstroRect {
+    let bar_w = (g.width_px as f64).min(surface_w);
+    let bar_left = (surface_w - bar_w) / 2.0;
+    let tip_len = g.default_height_px as f64 * 6.0;
+    AstroRect {
+        x: bar_left + tip_len,
+        top: 0.0,
+        w: (bar_w - 2.0 * tip_len).max(0.0),
+        bottom: (surface_h - dock_stack_px(g) as f64).max(0.0),
+    }
+}
+
+/// The astro view (`BarState::AppGrid`): a full-height, solid-black backdrop
+/// panel spanning the astro rect `[D, h-D]`, revealed by a clip that extrudes
+/// it *up* from its own bottom edge as `grid_amount` goes 0 → 1. Because it
+/// runs after `draw_bar`, it composites on top of the dock sections.
+///
+/// SLICE 1 (astro-view): this is the geometry foundation. The backdrop is the
+/// new astro surface; the interim content is the existing radial app grid,
+/// re-centered into the rect so app-launch keeps working — planets + ASCII
+/// backdrop replace it in slices 4-5. Sliver fusion/travel is slice 2.
 fn draw_app_grid_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &Drag) {
     let v = drag.visual();
     let a = v.grid_amount;
@@ -372,37 +419,31 @@ fn draw_app_grid_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag:
     }
     let Some(state) = drag.grid_state() else { return };
 
-    let bar_w = (g.width_px as f64).min(w);
-    let bar_h = g.default_height_px as f64;
-    let bar_left = (w - bar_w) / 2.0;
-    let bar_bot_y = h - g.margin_bottom_px as f64;
-    let bar_top_y = bar_bot_y - bar_h;
-    let sliver_top = bar_top_y - bar_h;
-    let tip_len = bar_h * 6.0;
-    let grid_h = g.grid_height_px as f64;
-    let grid_w = (bar_w - 2.0 * tip_len).max(0.0);
-    let grid_x = bar_left + tip_len;
-
-    let center_x = bar_left + bar_w / 2.0;
-    let center_y = sliver_top - grid_h / 2.0;
-    let panel_top = sliver_top - grid_h * a;
-    let card_h = (sliver_top - panel_top).max(0.0);
+    let rect = astro_rect(w, h, g);
+    if rect.w <= 0.0 || rect.bottom <= rect.top {
+        return;
+    }
     let corner = 12.0;
 
-    let bg_r = 0.161;
-    let bg_g = 0.180;
-    let bg_b = 0.259;
+    // Extrude the panel up from its bottom edge; the rounded clip does the
+    // reveal, so the fill itself stays fully opaque (solid black, zero
+    // translucency per note 010).
+    let full_h = rect.bottom - rect.top;
+    let panel_top = rect.bottom - full_h * a;
+    let card_h = (rect.bottom - panel_top).max(0.0);
 
     ctx.save().ok();
-    rounded_rect_path(ctx, grid_x, panel_top, grid_w, card_h, corner);
+    rounded_rect_path(ctx, rect.x, panel_top, rect.w, card_h, corner);
     ctx.clip();
 
-    if card_h > 0.0 {
-        ctx.set_source_rgba(bg_r, bg_g, bg_b, 0.40 * a);
-        ctx.rectangle(grid_x, panel_top, grid_w, card_h);
-        let _ = ctx.fill();
-    }
+    ctx.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+    ctx.rectangle(rect.x, panel_top, rect.w, card_h);
+    let _ = ctx.fill();
 
+    // Interim: the radial grid centered in the rect (replaced by planets in
+    // slice 4). The whole-grid fade rides on `a` so it appears with the panel.
+    let center_x = rect.x + rect.w / 2.0;
+    let center_y = (rect.top + rect.bottom) / 2.0;
     let icon_loader = |id: &str, spec: Option<&str>| -> Option<(cairo::ImageSurface, f64)> {
         let s = drag.app_icon(id, spec, 41)?;
         Some((s, 41.0))
@@ -1263,13 +1304,12 @@ fn install_section_click_handler(
 
         if bar_state == BarState::AppGrid {
             if let Some(state) = drag.grid_state() {
-                let bar_w = (geom.width_px as f64).min(surface_w);
-                let bar_left = (surface_w - bar_w) / 2.0;
-                let center_x = bar_left + bar_w / 2.0;
-                let bar_bot_y = surface_h - geom.margin_bottom_px as f64;
-                let bar_top_y = bar_bot_y - geom.default_height_px as f64;
-                let sliver_top = bar_top_y - geom.default_height_px as f64;
-                let center_y = sliver_top - geom.grid_height_px as f64 / 2.0;
+                // Mirror draw_app_grid_overlay: the interim radial grid is
+                // centered in the astro rect (surface coords), so tap targets
+                // key off the same real-surface geometry.
+                let rect = astro_rect(surface_w, surface_h, &geom);
+                let center_x = rect.x + rect.w / 2.0;
+                let center_y = (rect.top + rect.bottom) / 2.0;
                 if let Some(entry) =
                     app_grid::hit_test(x, y, &state, center_x, center_y, 1.0)
                 {

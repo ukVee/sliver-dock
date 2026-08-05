@@ -524,12 +524,24 @@ impl Drag {
             .map(|(k, s)| format!(r#"{{"x":{},"y":{},"state":"{}"}}"#, k.x, k.y, s.as_str()))
             .collect();
         entries.sort();
+        // Live surface dimensions — the compositor-assigned size, which is the
+        // single source of truth for all vertical geometry (astro sizes the
+        // surface `screen_h - D` tall). Exposed so geometry can be verified
+        // without a throwaway probe, as
+        // `incident-20260801-app-grid-invisible-stale-surface-height` needed.
+        let (sw, sh) = self
+            .window
+            .surface()
+            .map(|s| (s.width(), s.height()))
+            .unwrap_or((0, 0));
         format!(
-            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"workspace":{{"x":{},"y":{}}},"map":[{}]}}"#,
+            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}]}}"#,
             self.state.get().as_str(),
             v.hidden_amount,
             v.detailed_amount,
             v.grid_amount,
+            sw,
+            sh,
             ws.x,
             ws.y,
             entries.join(",")
@@ -612,16 +624,20 @@ impl Drag {
         }
         let g = &self.geom;
         let bar_w = g.width_px.min(win_w);
-        // `win_h` is the real surface height — `grid_height_px` taller than
-        // the pre-grid window. The bar is bottom-anchored, so the input
-        // region is measured up from the bottom edge. Using the old
-        // `margin+default+detailed` constant here pinned the region to the
-        // top `~107px` of a 507px surface, leaving the visible bar unclickable.
+        // `win_h` is the real surface height (astro sizes it `screen_h - D`).
+        // The bar is bottom-anchored, so the input region is measured up from
+        // the bottom edge — never from a `margin+default+detailed(+grid)`
+        // constant, which pinned the region to the top of the surface and left
+        // the visible bar unclickable
+        // (`incident-20260801-app-grid-invisible-stale-surface-height`).
         let bar_top = win_h - g.margin_bottom_px - g.default_height_px;
 
         let extend_up = if self.input_should_be_expanded() {
             if self.grid_expand_needed() {
-                g.default_height_px + g.grid_height_px
+                // AppGrid: the astro rect fills the whole surface above the
+                // bar (screen `[D, h-D]`); cover it entirely. `bar_top` clamps
+                // the region's top to the surface top (y=0).
+                bar_top.max(0)
             } else {
                 g.detailed_content_height_px
             }
