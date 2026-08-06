@@ -24,7 +24,7 @@ use crate::apps::{self, AppEntry};
 use crate::battery::{self, BatteryInfo, BatteryState};
 use crate::config::{self, Animation, Geometry};
 use crate::cpu::{self, CpuInfo};
-use crate::drag::{self, Direction, Drag};
+use crate::drag::{self, Direction, Drag, Visual};
 use crate::ipc;
 use crate::state::{BarState, WorkspaceId};
 use crate::wayfire::{self, GridSize};
@@ -79,6 +79,9 @@ fn on_activate(app: &Application) {
     area.set_draw_func(move |_, ctx, w, h| {
         draw_bar(ctx, w as f64, h as f64, &geom, &anim, &drag_for_draw);
         draw_app_grid_overlay(ctx, w as f64, h as f64, &geom, &drag_for_draw);
+        // The astro sliver is the astro view's top border and paints last, on
+        // top of the black backdrop it just pulled out from behind the dock.
+        draw_astro_sliver(ctx, w as f64, h as f64, &geom, &drag_for_draw);
     });
 
     let popovers = build_info_popovers(&area);
@@ -342,34 +345,123 @@ fn draw_bar(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, a: &Animation, dra
     let _ = ctx.fill();
 
     if v.hidden_amount < 0.999 {
-        // The sliver rides up with the detailed lift so it caps the *top* of
-        // the detailed view (screen `h - D`) instead of floating at the
+        // The dock sliver rides up with the detailed lift so it caps the *top*
+        // of the detailed view (screen `h - D`) instead of floating at the
         // resting bar position. At detailed_amount = 1 this lands exactly on
         // the astro-view bottom border (`bar_top - lift == h - D`), so the
-        // dock sliver and the astro bottom border are one line — see note
-        // 010 §Frame spec (Detailed position amended 2026-08-05: top of the
+        // dock sliver *is* the astro view's bottom border — see note 010
+        // §Frame spec (Detailed position amended 2026-08-05: top of the
         // detailed view, superseding "sits on the main bar").
-        draw_sliver_bar(ctx, bar_left, bar_w, bar_h, bar_top - lift, slope, alpha);
+        let stack = sliver_stack(w, h, g, &v);
+        ctx.set_source_rgba(0.05, 0.05, 0.05, alpha);
+        spear_path(
+            ctx,
+            bar_left,
+            bar_w,
+            stack.dock_top,
+            stack.dock_bot,
+            stack.tip_len,
+            stack.dock_tip_y,
+            slope,
+        );
+        let _ = ctx.fill();
     }
 }
 
-fn draw_sliver_bar(ctx: &CairoContext, x: f64, w: f64, bar_h: f64, main_bar_top: f64, slope: f64, alpha: f64) {
-    let sliver_top = main_bar_top - bar_h;
-    let sliver_bot = main_bar_top;
-    let (left_tip, left_inner, right_inner, right_tip, off_x, off_y) = spear_geom(x, w, bar_h, slope);
-    let mid_y = (sliver_top + sliver_bot) / 2.0;
+/// The astro sliver — the astro view's moving handle and top border. Painted
+/// after the backdrop so it caps the panel it pulled out. Closed, it sits
+/// directly on the dock sliver and the two read as one fused trapezoid; see
+/// [`sliver_stack`].
+fn draw_astro_sliver(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &Drag) {
+    let v = drag.visual();
+    if v.hidden_amount >= 0.999 {
+        return;
+    }
+    let bar_w = (g.width_px as f64).min(w);
+    let bar_left = (w - bar_w) / 2.0;
+    let stack = sliver_stack(w, h, g, &v);
 
-    ctx.set_source_rgba(0.05, 0.05, 0.05, alpha);
-
-    ctx.move_to(left_inner, sliver_top);
-    ctx.line_to(right_inner, sliver_top);
-    ctx.curve_to(right_inner + off_x, sliver_top, right_tip, mid_y - off_y, right_tip, mid_y);
-    ctx.curve_to(right_tip, mid_y + off_y, right_inner + off_x, sliver_bot, right_inner, sliver_bot);
-    ctx.line_to(left_inner, sliver_bot);
-    ctx.curve_to(left_inner - off_x, sliver_bot, left_tip, mid_y + off_y, left_tip, mid_y);
-    ctx.curve_to(left_tip, mid_y - off_y, left_inner - off_x, sliver_top, left_inner, sliver_top);
-    ctx.close_path();
+    ctx.set_source_rgba(0.05, 0.05, 0.05, 0.92 * (1.0 - v.hidden_amount));
+    spear_path(
+        ctx,
+        bar_left,
+        bar_w,
+        stack.astro_top,
+        stack.astro_bot,
+        stack.tip_len,
+        stack.astro_tip_y,
+        g.taper_slope,
+    );
     let _ = ctx.fill();
+}
+
+/// Separation (px) over which the fused pair resolves into two independent
+/// spears. Short enough that the split reads as instant on a flick, long
+/// enough that the tips morph instead of popping.
+const SLIVER_SPLIT_PX: f64 = 24.0;
+
+/// Vertical geometry of the two slivers for the current frame, plus the tip
+/// shape that fuses or splits them.
+///
+/// **Fused (`grid_amount == 0`).** The astro sliver sits directly on the dock
+/// sliver and both are drawn with a tip derived from their *combined* 12px
+/// height (`tip_len = 12 · 6`), each tipping at the shared edge between them:
+/// their union is exactly one 12px spear. Drawing two independently tipped 6px
+/// spears stacked instead pinches back to the body width at the junction — the
+/// misaligned bowtie note 010 §Frame spec calls out.
+///
+/// **Splitting (`grid_amount` opening).** The astro sliver travels from the
+/// fused position up to the astro rect's top border, and the shared tip
+/// splits: over the first [`SLIVER_SPLIT_PX`] of separation each half's tip
+/// slides from the shared edge to its own mid-line while `tip_len` relaxes
+/// from the fused 72px to a lone sliver's 36px. The fused spear *becomes* two
+/// spears continuously — no pop at the moment of separation. The dock sliver
+/// stays put as the astro view's bottom border.
+struct SliverStack {
+    dock_top: f64,
+    dock_bot: f64,
+    astro_top: f64,
+    astro_bot: f64,
+    /// Shared by both halves — they are one shape until they separate.
+    tip_len: f64,
+    dock_tip_y: f64,
+    astro_tip_y: f64,
+}
+
+fn sliver_stack(surface_w: f64, surface_h: f64, g: &Geometry, v: &Visual) -> SliverStack {
+    let bar_h = g.default_height_px as f64;
+    // Same resting/hidden/lift math as `draw_bar`, so the dock sliver lands on
+    // the main bar's top edge in every state.
+    let max_offset = (g.margin_bottom_px + g.default_height_px) as f64 + 4.0;
+    let bar_bot = surface_h - g.margin_bottom_px as f64 + v.hidden_amount * max_offset;
+    let lift = v.detailed_amount * g.detailed_content_height_px as f64;
+
+    let dock_bot = bar_bot - bar_h - lift;
+    let dock_top = dock_bot - bar_h;
+    let fused_top = dock_top - bar_h;
+
+    // Travel: the astro sliver's top edge runs from the fused position to the
+    // astro rect's top border, so at full open it *is* the top border (and the
+    // backdrop's top edge follows it — see `draw_app_grid_overlay`).
+    let astro_top = lerp(fused_top, astro_rect(surface_w, surface_h, g).top, v.grid_amount);
+    let astro_bot = astro_top + bar_h;
+
+    let split = ((dock_top - astro_bot) / SLIVER_SPLIT_PX).clamp(0.0, 1.0);
+    let tip_len = lerp(2.0 * bar_h * SPEAR_TIP_RATIO, bar_h * SPEAR_TIP_RATIO, split);
+
+    SliverStack {
+        dock_top,
+        dock_bot,
+        astro_top,
+        astro_bot,
+        tip_len,
+        dock_tip_y: lerp(dock_top, dock_top + bar_h / 2.0, split),
+        astro_tip_y: lerp(astro_bot, astro_bot - bar_h / 2.0, split),
+    }
+}
+
+fn lerp(a: f64, b: f64, t: f64) -> f64 {
+    a + (b - a) * t
 }
 
 /// The dock's own vertical footprint from the screen bottom in the Detailed
@@ -400,7 +492,7 @@ struct AstroRect {
 fn astro_rect(surface_w: f64, surface_h: f64, g: &Geometry) -> AstroRect {
     let bar_w = (g.width_px as f64).min(surface_w);
     let bar_left = (surface_w - bar_w) / 2.0;
-    let tip_len = g.default_height_px as f64 * 6.0;
+    let tip_len = g.default_height_px as f64 * SPEAR_TIP_RATIO;
     AstroRect {
         x: bar_left + tip_len,
         top: 0.0,
@@ -432,11 +524,14 @@ fn draw_app_grid_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag:
     }
     let corner = 12.0;
 
-    // Extrude the panel up from its bottom edge; the rounded clip does the
-    // reveal, so the fill itself stays fully opaque (solid black, zero
+    // The panel is *pulled out* by the astro sliver: its top edge is the
+    // sliver's top edge, so the black extrudes from behind the travelling
+    // sliver rather than animating on its own clock (note 010 §Transition).
+    // Clamped to the rect bottom for the Closed → AppGrid path, where the
+    // sliver starts below the rect (the dock is still un-lifted). The rounded
+    // clip does the reveal, so the fill stays fully opaque (solid black, zero
     // translucency per note 010).
-    let full_h = rect.bottom - rect.top;
-    let panel_top = rect.bottom - full_h * a;
+    let panel_top = sliver_stack(w, h, g, &v).astro_top.min(rect.bottom);
     let card_h = (rect.bottom - panel_top).max(0.0);
 
     ctx.save().ok();
@@ -1642,8 +1737,49 @@ fn top_half_path(
     ctx.close_path();
 }
 
+/// Tip length per unit of spear height — the "6×" ratio the whole silhouette
+/// keys off. A fused 12px sliver pair therefore tips at 72px, a lone 6px
+/// sliver at 36px (which is also the astro rect's side indent).
+const SPEAR_TIP_RATIO: f64 = 6.0;
+
+/// A closed spear outline with an explicitly placed tip.
+///
+/// Generalizes [`spear_geom`]'s symmetric shape: `tip_y` need not be the
+/// vertical middle, so one call draws a lone sliver (tip centred), a fused
+/// half (tip on the shared edge, degenerating that side's curve into the
+/// straight junction line), or anything between. The bezier handles scale with
+/// each side's own distance to the tip, so a degenerate side stays flat
+/// instead of bulging. That continuity is what lets the fused pair split
+/// without popping — see [`SliverStack`].
+#[allow(clippy::too_many_arguments)]
+fn spear_path(
+    ctx: &CairoContext,
+    x: f64,
+    w: f64,
+    top: f64,
+    bot: f64,
+    tip_len: f64,
+    tip_y: f64,
+    slope: f64,
+) {
+    let (left_tip, right_tip) = (x, x + w);
+    let (left_inner, right_inner) = (x + tip_len, x + w - tip_len);
+    let off_x = slope * tip_len;
+    let off_top = slope * (tip_y - top);
+    let off_bot = slope * (bot - tip_y);
+
+    ctx.move_to(left_inner, top);
+    ctx.line_to(right_inner, top);
+    ctx.curve_to(right_inner + off_x, top, right_tip, tip_y - off_top, right_tip, tip_y);
+    ctx.curve_to(right_tip, tip_y + off_bot, right_inner + off_x, bot, right_inner, bot);
+    ctx.line_to(left_inner, bot);
+    ctx.curve_to(left_inner - off_x, bot, left_tip, tip_y + off_bot, left_tip, tip_y);
+    ctx.curve_to(left_tip, tip_y - off_top, left_inner - off_x, top, left_inner, top);
+    ctx.close_path();
+}
+
 fn spear_geom(x: f64, w: f64, bar_h: f64, slope: f64) -> (f64, f64, f64, f64, f64, f64) {
-    let tip_len = bar_h * 6.0;
+    let tip_len = bar_h * SPEAR_TIP_RATIO;
     let off_x = slope * tip_len;
     let off_y = slope * (bar_h / 2.0);
     (x, x + tip_len, x + w - tip_len, x + w, off_x, off_y)
@@ -1817,17 +1953,20 @@ fn detailed_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i3
     (x, y, bar_w, h)
 }
 
-/// Sliver-edge zone — 15px strip immediately above the sliver bar. Full
-/// bar width, centered horizontally. Y = sliver_top - 15.
+/// Sliver-edge zone — the astro sliver's grab target. Full bar width,
+/// centered horizontally, and **state-dependent**, because the astro sliver
+/// moves in every state:
 ///
-/// State-dependent: the sliver rides up with the detailed lift, so in the
-/// Detailed / AppGrid states the swipe-open zone lifts by
-/// `detailed_content_height_px` to stay over the sliver at the top of the
-/// detailed view (`sh - D - 15`). Previously fixed at the Closed position,
-/// which left the open-gesture zone stranded at the bottom in Detailed.
-/// Must be re-registered on every state settle (see
-/// `drag::update_zone_states`) — `update_zone_bounds` alone only fires on
-/// map + monitor-change.
+/// * `Closed` — fused on the dock sliver; zone covers it plus a 15px
+///   run-up band above.
+/// * `Detailed` — the fused pair has ridden up by `detailed_content_height_px`
+///   to cap the detailed view; the zone lifts with it.
+/// * `AppGrid` — the astro sliver has travelled to the top border at screen
+///   `y = D`; the close gesture (swipe-down) lives up there on it, not on the
+///   dock sliver left behind at the bottom (note 010 §Transition).
+///
+/// Must be re-registered on every state settle (see `drag::update_zone_states`)
+/// — `update_zone_bounds` alone only fires on map + monitor-change.
 pub(crate) fn sliver_edge_zone_bounds(
     sw: i32,
     sh: i32,
@@ -1836,12 +1975,32 @@ pub(crate) fn sliver_edge_zone_bounds(
 ) -> (i32, i32, i32, i32) {
     let bar_w = geom.width_px.min(sw);
     let x = (sw - bar_w) / 2;
+    const RUN_UP_PX: i32 = 15;
+
+    if matches!(state, BarState::AppGrid) {
+        // Astro rect top in screen coords = D. The sliver occupies its first
+        // `default_height_px`; the run-up band hangs below it, inside the view.
+        return (
+            x,
+            dock_stack_px(geom),
+            bar_w,
+            geom.default_height_px + RUN_UP_PX,
+        );
+    }
+
     let lift = match state {
-        BarState::Detailed | BarState::AppGrid => geom.detailed_content_height_px,
+        BarState::Detailed => geom.detailed_content_height_px,
         _ => 0,
     };
-    let y = sh - geom.margin_bottom_px - geom.default_height_px * 2 - 15 - lift;
-    (x, y, bar_w, 15)
+    // Top of the fused pair = above the main bar, the dock sliver, and the
+    // astro sliver stacked on it.
+    let fused_top = sh - geom.margin_bottom_px - geom.default_height_px * 3 - lift;
+    (
+        x,
+        fused_top - RUN_UP_PX,
+        bar_w,
+        RUN_UP_PX + geom.default_height_px,
+    )
 }
 
 /// 1Hz redraw loop for the clock. Always running — `queue_draw` is cheap
@@ -2065,5 +2224,246 @@ mod tests {
     fn row_layout_empty() {
         let rects = row_layout(0.0, 200.0, 200.0, 66.0, 0, 0.0);
         assert!(rects.is_empty());
+    }
+
+    // ---- astro slice 2: sliver fusion + travel -------------------------
+
+    /// Surface as slice 1 sizes it: `screen_h - D` for a 1280x853 panel.
+    const SURFACE_W: f64 = 1280.0;
+    const SURFACE_H: f64 = 746.0;
+
+    fn visual(detailed: f64, grid: f64) -> Visual {
+        Visual { hidden_amount: 0.0, detailed_amount: detailed, grid_amount: grid }
+    }
+
+    #[test]
+    fn sliver_stack_fused_when_astro_closed() {
+        let g = Geometry::default();
+        for detailed in [0.0, 1.0] {
+            let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(detailed, 0.0));
+            // Halves are adjacent — no gap to reveal the backdrop through.
+            assert!((s.astro_bot - s.dock_top).abs() < 1e-9, "detailed={detailed}");
+            // Both tip on the shared edge with the combined-height tip length,
+            // so the union is exactly one 12px spear (note 010 §Frame spec).
+            assert!((s.tip_len - 2.0 * g.default_height_px as f64 * SPEAR_TIP_RATIO).abs() < 1e-9);
+            assert!((s.astro_tip_y - s.astro_bot).abs() < 1e-9);
+            assert!((s.dock_tip_y - s.dock_top).abs() < 1e-9);
+            // Stack is exactly two slivers tall.
+            assert!((s.dock_bot - s.astro_top - 2.0 * g.default_height_px as f64).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn sliver_stack_fused_rides_the_detailed_lift() {
+        let g = Geometry::default();
+        let closed = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(0.0, 0.0));
+        let detailed = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(1.0, 0.0));
+        let lift = g.detailed_content_height_px as f64;
+        assert!((closed.dock_bot - detailed.dock_bot - lift).abs() < 1e-9);
+        // Detailed: the dock sliver's bottom edge is the astro rect's bottom
+        // border — one line, per the amended frame spec.
+        let rect = astro_rect(SURFACE_W, SURFACE_H, &g);
+        assert!((detailed.dock_bot - rect.bottom).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sliver_stack_open_puts_astro_on_the_top_border() {
+        let g = Geometry::default();
+        let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(1.0, 1.0));
+        let rect = astro_rect(SURFACE_W, SURFACE_H, &g);
+        // Astro sliver = top border; dock sliver stayed as the bottom border.
+        assert!((s.astro_top - rect.top).abs() < 1e-9);
+        assert!((s.dock_bot - rect.bottom).abs() < 1e-9);
+        // Fully split: each half owns a lone sliver's tip, centred.
+        assert!((s.tip_len - g.default_height_px as f64 * SPEAR_TIP_RATIO).abs() < 1e-9);
+        assert!((s.astro_tip_y - (s.astro_top + s.astro_bot) / 2.0).abs() < 1e-9);
+        assert!((s.dock_tip_y - (s.dock_top + s.dock_bot) / 2.0).abs() < 1e-9);
+        // The open sliver's tips reach exactly the rect's side indent.
+        let bar_left = (SURFACE_W - (g.width_px as f64).min(SURFACE_W)) / 2.0;
+        assert!((bar_left + s.tip_len - rect.x).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sliver_stack_travel_is_monotonic_and_tips_relax_once() {
+        let g = Geometry::default();
+        let mut prev_top = f64::MAX;
+        let mut prev_tip = f64::MAX;
+        for i in 0..=20 {
+            let t = i as f64 / 20.0;
+            let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(1.0, t));
+            assert!(s.astro_top < prev_top, "astro sliver must keep travelling up at t={t}");
+            assert!(s.tip_len <= prev_tip + 1e-9, "tip length must not grow back at t={t}");
+            assert!(s.astro_bot <= s.dock_top + 1e-9, "halves must never overlap at t={t}");
+            prev_top = s.astro_top;
+            prev_tip = s.tip_len;
+        }
+        // The tip morph completes inside the first `SLIVER_SPLIT_PX` of travel.
+        let travel = SURFACE_H - g.margin_bottom_px as f64
+            - g.default_height_px as f64 * 3.0
+            - g.detailed_content_height_px as f64;
+        let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(1.0, SLIVER_SPLIT_PX / travel));
+        assert!((s.tip_len - g.default_height_px as f64 * SPEAR_TIP_RATIO).abs() < 1e-6);
+    }
+
+    /// The fusion claim, checked in pixels: two fused halves painted separately
+    /// cover exactly the same area as one spear of their combined height. A
+    /// regression here means the bowtie is back.
+    #[test]
+    fn fused_halves_paint_the_same_shape_as_one_tall_spear() {
+        let g = Geometry::default();
+        let (w, h) = (240.0, 40.0);
+        let bar_h = g.default_height_px as f64;
+        let (top, mid, bot) = (10.0, 10.0 + bar_h, 10.0 + 2.0 * bar_h);
+        let tip = 2.0 * bar_h * SPEAR_TIP_RATIO;
+
+        let render = |paint: &dyn Fn(&CairoContext)| -> Vec<u8> {
+            let mut surface =
+                cairo::ImageSurface::create(cairo::Format::A8, w as i32, h as i32).unwrap();
+            let ctx = CairoContext::new(&surface).unwrap();
+            ctx.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+            paint(&ctx);
+            drop(ctx);
+            surface.data().unwrap().to_vec()
+        };
+
+        let fused = render(&|ctx: &CairoContext| {
+            spear_path(ctx, 0.0, w, top, bot, tip, mid, g.taper_slope);
+            ctx.fill().unwrap();
+        });
+        let halves = render(&|ctx: &CairoContext| {
+            spear_path(ctx, 0.0, w, top, mid, tip, mid, g.taper_slope);
+            ctx.fill().unwrap();
+            spear_path(ctx, 0.0, w, mid, bot, tip, mid, g.taper_slope);
+            ctx.fill().unwrap();
+        });
+        assert_eq!(fused.len(), halves.len());
+        let differing = fused
+            .iter()
+            .zip(&halves)
+            .filter(|(a, b)| a.abs_diff(**b) > 8)
+            .count();
+        // Only antialias seams along the shared edge may differ.
+        assert!(differing < 16, "fused pair diverges from one spear in {differing} px");
+    }
+
+    #[test]
+    fn sliver_zone_tracks_the_sliver_in_every_state() {
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        let d = dock_stack_px(&g);
+
+        let (_, closed_y, _, closed_h) = sliver_edge_zone_bounds(sw, sh, &g, BarState::Closed);
+        // Covers the astro half of the fused pair plus the run-up band above.
+        assert_eq!(closed_y, sh - g.margin_bottom_px - g.default_height_px * 3 - 15);
+        assert_eq!(closed_h, 15 + g.default_height_px);
+
+        let (_, detailed_y, _, _) = sliver_edge_zone_bounds(sw, sh, &g, BarState::Detailed);
+        assert_eq!(detailed_y, closed_y - g.detailed_content_height_px);
+
+        // Astro open: the zone has travelled to the top border at y = D.
+        let (_, grid_y, _, grid_h) = sliver_edge_zone_bounds(sw, sh, &g, BarState::AppGrid);
+        assert_eq!(grid_y, d);
+        assert_eq!(grid_h, g.default_height_px + 15);
+        assert!(grid_y < detailed_y, "close handle must sit above the dock sliver");
+    }
+
+    /// Visual aid, not an assertion: dumps the sliver assembly + backdrop at
+    /// real device geometry to `$SLIVER_FRAME_DIR` (default `/tmp`), one
+    /// binary PPM per travel frame (PPM keeps this dep-free — cairo's PNG
+    /// writer is behind a feature we don't otherwise need; `ffmpeg -i x.ppm
+    /// x.png` to view). Screencopy is broken in this compositor session
+    /// (`grim` / `wf-recorder` both fail on eDP-1), so this is how the shape
+    /// gets reviewed without a screenshot. Run:
+    /// `cargo test dump_astro_frames -- --ignored --nocapture`
+    #[test]
+    #[ignore = "writes PNGs for human review"]
+    fn dump_astro_frames() {
+        let g = Geometry::default();
+        let dir = std::env::var("SLIVER_FRAME_DIR").unwrap_or_else(|_| "/tmp".into());
+        for (name, v) in [
+            ("fused-closed", visual(0.0, 0.0)),
+            ("fused-detailed", visual(1.0, 0.0)),
+            ("split-early", visual(1.0, 0.06)),
+            ("travelling", visual(1.0, 0.5)),
+            ("open", visual(1.0, 1.0)),
+        ] {
+            let mut surface = cairo::ImageSurface::create(
+                cairo::Format::Rgb24,
+                SURFACE_W as i32,
+                SURFACE_H as i32,
+            )
+            .unwrap();
+            {
+                let ctx = CairoContext::new(&surface).unwrap();
+                ctx.set_source_rgb(0.35, 0.38, 0.45); // wallpaper stand-in
+                ctx.paint().unwrap();
+
+                let rect = astro_rect(SURFACE_W, SURFACE_H, &g);
+                let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &v);
+                if v.grid_amount > 0.0 {
+                    let top = s.astro_top.min(rect.bottom);
+                    ctx.set_source_rgb(0.0, 0.0, 0.0);
+                    rounded_rect_path(&ctx, rect.x, top, rect.w, rect.bottom - top, 12.0);
+                    ctx.fill().unwrap();
+                }
+
+                let bar_w = (g.width_px as f64).min(SURFACE_W);
+                let bar_left = (SURFACE_W - bar_w) / 2.0;
+                let bar_h = g.default_height_px as f64;
+                ctx.set_source_rgba(0.05, 0.05, 0.05, 0.92);
+                // Main bar halves first, then the slivers — same order as the
+                // live draw, so the junctions read the same.
+                let bar_bot = SURFACE_H - g.margin_bottom_px as f64;
+                let cut_y = bar_bot - bar_h / 2.0;
+                let lift = v.detailed_amount * g.detailed_content_height_px as f64;
+                bottom_half_path(&ctx, bar_left, bar_w, bar_h, cut_y, bar_bot, g.taper_slope);
+                ctx.fill().unwrap();
+                top_half_path(
+                    &ctx,
+                    bar_left,
+                    bar_w,
+                    bar_h,
+                    s.dock_bot,
+                    cut_y - lift,
+                    g.taper_slope,
+                );
+                ctx.fill().unwrap();
+                spear_path(
+                    &ctx, bar_left, bar_w, s.dock_top, s.dock_bot, s.tip_len, s.dock_tip_y,
+                    g.taper_slope,
+                );
+                ctx.fill().unwrap();
+                spear_path(
+                    &ctx, bar_left, bar_w, s.astro_top, s.astro_bot, s.tip_len, s.astro_tip_y,
+                    g.taper_slope,
+                );
+                ctx.fill().unwrap();
+            }
+            // Rgb24 is 32-bit native-endian xRGB — little-endian byte order
+            // B,G,R,x — with a padded stride.
+            let stride = surface.stride() as usize;
+            let data = surface.data().unwrap();
+            let mut ppm = format!("P6\n{} {}\n255\n", SURFACE_W as i32, SURFACE_H as i32)
+                .into_bytes();
+            for row in 0..SURFACE_H as usize {
+                for col in 0..SURFACE_W as usize {
+                    let p = row * stride + col * 4;
+                    ppm.extend_from_slice(&[data[p + 2], data[p + 1], data[p]]);
+                }
+            }
+            let path = format!("{dir}/astro-{name}.ppm");
+            std::fs::write(&path, &ppm).unwrap();
+            println!("wrote {path}");
+        }
+    }
+
+    #[test]
+    fn sliver_zone_x_is_centred_on_the_bar() {
+        let g = Geometry::default();
+        for state in [BarState::Closed, BarState::Detailed, BarState::AppGrid] {
+            let (x, _, w, _) = sliver_edge_zone_bounds(1280, 853, &g, state);
+            assert_eq!(w, g.width_px);
+            assert_eq!(x, (1280 - g.width_px) / 2);
+        }
     }
 }
