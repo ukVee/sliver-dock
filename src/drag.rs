@@ -577,7 +577,7 @@ impl Drag {
         if target == BarState::AppGrid {
             self.rebuild_grid();
         }
-        update_zone_states(target);
+        update_zone_states(target, &self.geom);
         self.refresh_input_region();
     }
 
@@ -685,7 +685,7 @@ impl Drag {
             self.rebuild_grid();
         }
         self.apply_visibility();
-        update_zone_states(target);
+        update_zone_states(target, &self.geom);
         self.refresh_input_region();
     }
 
@@ -953,7 +953,7 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 ///   * Detailed → detailed bidir zone (swipe down anywhere on the
 ///     expanded window closes to Closed; up arm is reserved for a
 ///     future workspaces-section grid-expand gesture)
-fn update_zone_states(state: BarState) {
+fn update_zone_states(state: BarState, geom: &Geometry) {
     zones::set_enabled(BAR_ZONE_ID, matches!(state, BarState::Closed));
     zones::set_enabled(BOTTOM_EDGE_ZONE_ID, matches!(state, BarState::Hidden));
     zones::set_enabled(DETAILED_ZONE_ID, false);
@@ -961,6 +961,16 @@ fn update_zone_states(state: BarState) {
         SLIVER_EDGE_ZONE_ID,
         matches!(state, BarState::Closed | BarState::Detailed | BarState::AppGrid),
     );
+    // The sliver-edge zone rides up with the detailed lift, so its screen-y
+    // is state-dependent — re-register its bounds on every state settle.
+    // Without this the swipe-open zone stayed pinned to the Closed position
+    // (`update_zone_bounds` only fires on map + monitor-change), so in the
+    // Detailed / AppGrid states the drag zone no longer sat over the visible
+    // sliver at the top of the detailed view.
+    if let Some((sw, sh)) = crate::panel::current_screen_size() {
+        let (x, y, w, h) = crate::panel::sliver_edge_zone_bounds(sw, sh, geom, state);
+        zones::update_bounds(SLIVER_EDGE_ZONE_ID, x, y, w, h);
+    }
 }
 
 #[cfg(test)]

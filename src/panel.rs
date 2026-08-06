@@ -92,10 +92,10 @@ fn on_activate(app: &Application) {
     let drag_for_map = Rc::clone(&drag);
     let geom_for_map = geom;
     window.connect_map(move |_| {
-        update_zone_bounds(&geom_for_map);
+        let s = drag_for_map.state();
+        update_zone_bounds(&geom_for_map, s);
         // Re-derive zone enabled flags now that the surface is mapped —
         // `set_visible(true)` in jump_to / ensure_mapped can race the map.
-        let s = drag_for_map.state();
         zones::set_enabled(drag::BOTTOM_EDGE_ZONE_ID, matches!(s, BarState::Hidden));
         zones::set_enabled(drag::BAR_ZONE_ID, matches!(s, BarState::Closed));
         zones::set_enabled(drag::DETAILED_ZONE_ID, false);
@@ -106,7 +106,7 @@ fn on_activate(app: &Application) {
         drag_for_map.refresh_input_region();
     });
 
-    watch_monitor_changes(geom);
+    watch_monitor_changes(Rc::clone(&drag), geom);
     spawn_clock_tick(&area);
     battery::spawn(Rc::clone(&drag));
     cpu::spawn(Rc::clone(&drag));
@@ -342,7 +342,14 @@ fn draw_bar(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, a: &Animation, dra
     let _ = ctx.fill();
 
     if v.hidden_amount < 0.999 {
-        draw_sliver_bar(ctx, bar_left, bar_w, bar_h, bar_top, slope, alpha);
+        // The sliver rides up with the detailed lift so it caps the *top* of
+        // the detailed view (screen `h - D`) instead of floating at the
+        // resting bar position. At detailed_amount = 1 this lands exactly on
+        // the astro-view bottom border (`bar_top - lift == h - D`), so the
+        // dock sliver and the astro bottom border are one line — see note
+        // 010 §Frame spec (Detailed position amended 2026-08-05: top of the
+        // detailed view, superseding "sits on the main bar").
+        draw_sliver_bar(ctx, bar_left, bar_w, bar_h, bar_top - lift, slope, alpha);
     }
 }
 
@@ -1680,7 +1687,7 @@ fn user_css_path() -> Option<std::path::PathBuf> {
     Some(base.join("sliver-dock").join("style.css"))
 }
 
-fn current_screen_size() -> Option<(i32, i32)> {
+pub(crate) fn current_screen_size() -> Option<(i32, i32)> {
     let display = gdk::Display::default()?;
     let monitors = display.monitors();
     let item = monitors.item(0)?;
@@ -1756,7 +1763,7 @@ fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
     // the app-grid (UpGrid direction); down is a no-op in this zone. Uses
     // travel_px=15 so a short swipe saturates progress. Enabled in Closed,
     // Detailed, and AppGrid states.
-    let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom);
+    let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom, initial);
     zones::register_bidir(
         drag::SLIVER_EDGE_ZONE_ID,
         sx,
@@ -1771,7 +1778,7 @@ fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
     );
 }
 
-fn update_zone_bounds(geom: &Geometry) {
+fn update_zone_bounds(geom: &Geometry, state: BarState) {
     let Some((sw, sh)) = current_screen_size() else { return };
     zones::update_bounds(
         drag::BOTTOM_EDGE_ZONE_ID,
@@ -1784,7 +1791,8 @@ fn update_zone_bounds(geom: &Geometry) {
     zones::update_bounds(drag::BAR_ZONE_ID, bx, by, bw, bh);
     let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, geom);
     zones::update_bounds(drag::DETAILED_ZONE_ID, dx, dy, dw, dh);
-    let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom);
+    // Sliver-edge zone is state-dependent (rides up with the detailed lift).
+    let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom, state);
     zones::update_bounds(drag::SLIVER_EDGE_ZONE_ID, sx, sy, sw_z, sh_z);
 }
 
@@ -1811,10 +1819,28 @@ fn detailed_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i3
 
 /// Sliver-edge zone — 15px strip immediately above the sliver bar. Full
 /// bar width, centered horizontally. Y = sliver_top - 15.
-fn sliver_edge_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i32) {
+///
+/// State-dependent: the sliver rides up with the detailed lift, so in the
+/// Detailed / AppGrid states the swipe-open zone lifts by
+/// `detailed_content_height_px` to stay over the sliver at the top of the
+/// detailed view (`sh - D - 15`). Previously fixed at the Closed position,
+/// which left the open-gesture zone stranded at the bottom in Detailed.
+/// Must be re-registered on every state settle (see
+/// `drag::update_zone_states`) — `update_zone_bounds` alone only fires on
+/// map + monitor-change.
+pub(crate) fn sliver_edge_zone_bounds(
+    sw: i32,
+    sh: i32,
+    geom: &Geometry,
+    state: BarState,
+) -> (i32, i32, i32, i32) {
     let bar_w = geom.width_px.min(sw);
     let x = (sw - bar_w) / 2;
-    let y = sh - geom.margin_bottom_px - geom.default_height_px * 2 - 15;
+    let lift = match state {
+        BarState::Detailed | BarState::AppGrid => geom.detailed_content_height_px,
+        _ => 0,
+    };
+    let y = sh - geom.margin_bottom_px - geom.default_height_px * 2 - 15 - lift;
     (x, y, bar_w, 15)
 }
 
@@ -1830,13 +1856,13 @@ fn spawn_clock_tick(area: &DrawingArea) {
     });
 }
 
-fn watch_monitor_changes(geom: Geometry) {
+fn watch_monitor_changes(drag: Rc<Drag>, geom: Geometry) {
     let Some(display) = gdk::Display::default() else { return };
     let monitors = display.monitors();
     let Some(item) = monitors.item(0) else { return };
     let Ok(monitor) = item.downcast::<gdk::Monitor>() else { return };
     monitor.connect_geometry_notify(move |_| {
-        update_zone_bounds(&geom);
+        update_zone_bounds(&geom, drag.state());
     });
 }
 
