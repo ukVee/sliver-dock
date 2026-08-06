@@ -25,6 +25,7 @@ use gtk4::{ApplicationWindow, DrawingArea};
 use crate::app_grid;
 use crate::apps::{self, AppEntry};
 use crate::battery::BatteryInfo;
+use crate::categories::Planet;
 use crate::config::{Animation, Behaviour, Geometry, Terminal};
 use crate::cpu::CpuInfo;
 use crate::state::{BarState, WorkspaceId};
@@ -196,6 +197,10 @@ pub struct Drag {
     launching_animation: RefCell<Option<glib::SourceId>>,
     launch_counts: RefCell<HashMap<String, u64>>,
     grid_state: RefCell<Option<app_grid::GridState>>,
+    /// Astro-view planets — the visible roster grouped by category, ordered
+    /// most-launched-first within each. Built from the same roster the apps
+    /// row uses; slice 4 lays these out as globes.
+    planets: RefCell<Vec<Planet>>,
 }
 
 impl Drag {
@@ -240,6 +245,7 @@ impl Drag {
             launching_animation: RefCell::new(None),
             launch_counts: RefCell::new(HashMap::new()),
             grid_state: RefCell::new(None),
+            planets: RefCell::new(Vec::new()),
         })
     }
 
@@ -349,6 +355,11 @@ impl Drag {
         let mut out: Vec<WorkspaceId> = set.into_iter().collect();
         out.sort_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
         out
+    }
+
+    pub fn set_planets(&self, planets: Vec<Planet>) {
+        *self.planets.borrow_mut() = planets;
+        self.area.queue_draw();
     }
 
     pub fn set_apps(&self, apps: Vec<AppEntry>) {
@@ -534,8 +545,24 @@ impl Drag {
             .surface()
             .map(|s| (s.width(), s.height()))
             .unwrap_or((0, 0));
+        // Planet roster, in render order. Same rationale as `surface` above:
+        // screencopy is unavailable in this compositor session, so the astro
+        // view's inputs have to be verifiable over IPC.
+        let planets: Vec<String> = self
+            .planets
+            .borrow()
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"{{"key":"{}","name":"{}","apps":{}}}"#,
+                    json_escape(&p.key),
+                    json_escape(&p.display_name),
+                    p.apps.len()
+                )
+            })
+            .collect();
         format!(
-            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}]}}"#,
+            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"planets":[{}]}}"#,
             self.state.get().as_str(),
             v.hidden_amount,
             v.detailed_amount,
@@ -544,7 +571,8 @@ impl Drag {
             sh,
             ws.x,
             ws.y,
-            entries.join(",")
+            entries.join(","),
+            planets.join(",")
         )
     }
 
@@ -715,6 +743,10 @@ impl Drag {
     pub fn load_launches(&self) {
         let counts = app_grid::load_launches();
         *self.launch_counts.borrow_mut() = counts;
+    }
+
+    pub fn launch_counts(&self) -> HashMap<String, u64> {
+        self.launch_counts.borrow().clone()
     }
 
     pub fn increment_launch_count(&self, id: &str) {
@@ -971,6 +1003,26 @@ fn update_zone_states(state: BarState, geom: &Geometry) {
         let (x, y, w, h) = crate::panel::sliver_edge_zone_bounds(sw, sh, geom, state);
         zones::update_bounds(SLIVER_EDGE_ZONE_ID, x, y, w, h);
     }
+}
+
+/// Minimal JSON string escaping for `dump_state`. Category keys and planet
+/// display names come from `.desktop` files and `categories.toml`, so they
+/// can carry quotes, backslashes or control characters that would otherwise
+/// produce unparseable `get-state` output.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
 mod app_grid;
 mod apps;
 mod battery;
+mod categories;
 mod config;
 mod cpu;
 mod drag;

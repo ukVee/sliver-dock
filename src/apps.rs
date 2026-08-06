@@ -35,6 +35,9 @@ pub struct AppEntry {
     pub exec: Option<String>,
     pub no_display: bool,
     pub hidden: bool,
+    /// Raw `Categories=` list in declared order, empties dropped. Resolution
+    /// to a single planet key lives in `categories.rs`.
+    pub categories: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -99,6 +102,7 @@ fn parse_entry(id: &str, body: &str) -> Option<AppEntry> {
     let mut no_display = false;
     let mut hidden = false;
     let mut entry_type: Option<String> = None;
+    let mut categories: Vec<String> = Vec::new();
     let mut in_section = false;
 
     for raw in body.lines() {
@@ -124,6 +128,17 @@ fn parse_entry(id: &str, body: &str) -> Option<AppEntry> {
             "Icon" => icon = Some(value.to_owned()),
             "Exec" => exec = Some(value.to_owned()),
             "Type" => entry_type = Some(value.to_owned()),
+            // Semicolon-separated and conventionally trailing-terminated
+            // (`Network;WebBrowser;`), so the split yields a final empty
+            // field we drop along with any stray blanks.
+            "Categories" => {
+                categories = value
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+            }
             "NoDisplay" => no_display = parse_bool(value),
             "Hidden" => hidden = parse_bool(value),
             _ => {}
@@ -143,6 +158,7 @@ fn parse_entry(id: &str, body: &str) -> Option<AppEntry> {
         exec,
         no_display,
         hidden,
+        categories,
     })
 }
 
@@ -279,17 +295,7 @@ pub fn build_visible(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) -> 
     let hidden: HashSet<&str> = cfg.hidden.iter().map(String::as_str).collect();
     let pinned_set: HashSet<&str> = cfg.pinned.iter().map(String::as_str).collect();
 
-    let apply_override = |mut e: AppEntry| -> AppEntry {
-        if let Some(o) = cfg.overrides.get(&e.id) {
-            if let Some(icon) = &o.icon {
-                e.icon = Some(icon.clone());
-            }
-            if let Some(name) = &o.display_name {
-                e.name = name.clone();
-            }
-        }
-        e
-    };
+    let apply_override = |e: AppEntry| -> AppEntry { apply_app_override(e, cfg) };
 
     let mut out: Vec<AppEntry> = Vec::new();
     for id in &cfg.pinned {
@@ -313,6 +319,48 @@ pub fn build_visible(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) -> 
     out
 }
 
+fn apply_app_override(mut e: AppEntry, cfg: &AppsConfig) -> AppEntry {
+    if let Some(o) = cfg.overrides.get(&e.id) {
+        if let Some(icon) = &o.icon {
+            e.icon = Some(icon.clone());
+        }
+        if let Some(name) = &o.display_name {
+            e.name = name.clone();
+        }
+    }
+    e
+}
+
+/// The full launchable roster, for the astro view — every scanned app the
+/// system considers user-launchable, sorted by display name.
+///
+/// Deliberately NOT `build_visible`: `apps.toml`'s `pinned`/`hidden` lists
+/// curate the *dock row* (this device hides 34 of 65 entries so only the 8
+/// pinned icons show), and applying that here would make `foot`, `flycast`,
+/// `nvim` and the Waydroid apps unreachable from the launcher that exists to
+/// reach them. `overrides` still applies — that's presentation, not
+/// curation.
+///
+/// Entries the `.desktop` file itself marks `NoDisplay` / `Hidden` are
+/// dropped: those are D-Bus activation stubs and authentication agents
+/// (`polkit-gnome-authentication-agent-1`), not apps. The retired grid took
+/// the raw registry and listed them; the astro view does not.
+pub fn build_launchable(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) -> Vec<AppEntry> {
+    let mut out: Vec<AppEntry> = entries
+        .values()
+        .filter(|e| !e.no_display && !e.hidden)
+        .cloned()
+        .map(|e| apply_app_override(e, cfg))
+        .collect();
+    out.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,7 +373,33 @@ mod tests {
             exec: Some("/usr/bin/true".to_string()),
             no_display: false,
             hidden: false,
+            categories: Vec::new(),
         }
+    }
+
+    #[test]
+    fn parse_categories_drops_trailing_empty() {
+        let e = parse_entry("a", "[Desktop Entry]\nName=A\nCategories=GNOME;GTK;Network;\n").unwrap();
+        assert_eq!(e.categories, ["GNOME", "GTK", "Network"]);
+    }
+
+    #[test]
+    fn parse_categories_absent_is_empty() {
+        let e = parse_entry("a", "[Desktop Entry]\nName=A\n").unwrap();
+        assert!(e.categories.is_empty());
+    }
+
+    #[test]
+    fn parse_categories_empty_value_is_empty() {
+        let e = parse_entry("a", "[Desktop Entry]\nName=A\nCategories=\n").unwrap();
+        assert!(e.categories.is_empty());
+    }
+
+    #[test]
+    fn parse_categories_ignores_locale_suffixed_key() {
+        let e = parse_entry("a", "[Desktop Entry]\nCategories[de]=Spiel;\nCategories=Game;\n")
+            .unwrap();
+        assert_eq!(e.categories, ["Game"]);
     }
 
     #[test]
@@ -448,6 +522,63 @@ mod tests {
         let visible = build_visible(&entries, &cfg);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "a");
+    }
+
+    #[test]
+    fn build_launchable_ignores_dock_row_curation() {
+        let mut entries = BTreeMap::new();
+        entries.insert("foot".to_string(), entry("foot", "foot"));
+        entries.insert("firefox".to_string(), entry("firefox", "Firefox"));
+        let cfg = AppsConfig {
+            pinned: vec!["firefox".to_string()],
+            hidden: vec!["foot".to_string()],
+            ..Default::default()
+        };
+        // build_visible honours the dock-row curation...
+        let visible = build_visible(&entries, &cfg);
+        assert_eq!(visible.len(), 1);
+        // ...the launcher roster does not.
+        let launchable = build_launchable(&entries, &cfg);
+        let ids: Vec<&str> = launchable.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["firefox", "foot"]);
+    }
+
+    #[test]
+    fn build_launchable_drops_no_display_and_hidden_entries() {
+        let mut entries = BTreeMap::new();
+        let mut agent = entry("polkit-agent", "Polkit Agent");
+        agent.no_display = true;
+        entries.insert("polkit-agent".to_string(), agent);
+        let mut stub = entry("stub", "Stub");
+        stub.hidden = true;
+        entries.insert("stub".to_string(), stub);
+        entries.insert("real".to_string(), entry("real", "Real App"));
+        let launchable = build_launchable(&entries, &AppsConfig::default());
+        assert_eq!(launchable.len(), 1);
+        assert_eq!(launchable[0].id, "real");
+    }
+
+    #[test]
+    fn build_launchable_applies_overrides() {
+        let mut entries = BTreeMap::new();
+        entries.insert("a".to_string(), entry("a", "Original"));
+        let mut overrides = BTreeMap::new();
+        overrides.insert("a".to_string(), AppOverride {
+            display_name: Some("Renamed".to_string()),
+            icon: Some("custom-icon".to_string()),
+        });
+        let cfg = AppsConfig {
+            overrides,
+            ..Default::default()
+        };
+        let launchable = build_launchable(&entries, &cfg);
+        assert_eq!(launchable[0].name, "Renamed");
+        assert_eq!(launchable[0].icon.as_deref(), Some("custom-icon"));
+    }
+
+    #[test]
+    fn build_launchable_empty_scan() {
+        assert!(build_launchable(&BTreeMap::new(), &AppsConfig::default()).is_empty());
     }
 
     #[test]

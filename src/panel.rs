@@ -22,6 +22,7 @@ use gtk4_layer_shell::{Edge, Layer, LayerShell};
 use crate::app_grid;
 use crate::apps::{self, AppEntry};
 use crate::battery::{self, BatteryInfo, BatteryState};
+use crate::categories;
 use crate::config::{self, Animation, Geometry};
 use crate::cpu::{self, CpuInfo};
 use crate::drag::{self, Direction, Drag, Visual};
@@ -70,8 +71,10 @@ fn on_activate(app: &Application) {
         window.clone(),
         area.clone(),
     );
-    load_apps_into(&drag);
+    // Launch counts first — `load_apps_into` orders each planet's apps by
+    // launch frequency, so the counts have to be in place before it runs.
     drag.load_launches();
+    load_apps_into(&drag);
 
     let geom = cfg.geometry;
     let anim = cfg.animation;
@@ -226,9 +229,13 @@ fn apply_command(req: &mut ipc::Request, drag: &Rc<Drag>, app: &Application) {
     }
 }
 
-/// Scan `.desktop` entries + load `apps.toml`, push the merged ordered
-/// list onto `Drag` so the apps section can render it. Logs a one-line
-/// summary so the user can sanity-check counts at startup.
+/// Scan `.desktop` entries + load `apps.toml`, push the merged ordered list
+/// onto `Drag` so the apps section can render it, then group the *launchable*
+/// roster into astro-view planets. Logs a one-line summary of each so the
+/// user can sanity-check counts at startup.
+///
+/// Requires `drag.load_launches()` to have run — planet contents are ordered
+/// most-launched-first.
 fn load_apps_into(drag: &Rc<Drag>) {
     let entries = apps::scan();
     let cfg = apps::load_config();
@@ -241,6 +248,25 @@ fn load_apps_into(drag: &Rc<Drag>) {
         cfg.hidden.len(),
         cfg.overrides.len(),
     );
+
+    // Planets come off the full launchable roster, not the dock row's
+    // curated `visible` — see `apps::build_launchable`.
+    let launchable = apps::build_launchable(&entries, &cfg);
+    let cat_cfg = categories::load_config();
+    let planets = categories::build_planets(&launchable, &cat_cfg, &drag.launch_counts());
+    let breakdown: Vec<String> = planets
+        .iter()
+        .map(|p| format!("{}:{}", p.display_name, p.apps.len()))
+        .collect();
+    eprintln!(
+        "sliver-dock: categories: {} planets from {} launchable apps (overrides {}) — {}",
+        planets.len(),
+        launchable.len(),
+        cat_cfg.overrides.len(),
+        breakdown.join(" "),
+    );
+    drag.set_planets(planets);
+
     drag.set_apps(visible);
     // Registry covers the full scan so the workspace montage can resolve
     // icons for hidden / NoDisplay apps that wouldn't show in the apps
