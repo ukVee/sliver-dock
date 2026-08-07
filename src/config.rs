@@ -15,6 +15,7 @@ pub struct Config {
     pub animation: Animation,
     pub terminal: Terminal,
     pub behaviour: Behaviour,
+    pub astro: Astro,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -97,6 +98,61 @@ impl Default for Behaviour {
             hide_when_fullscreen: true,
             remember_per_workspace: true,
             auto_close_app_grid: true,
+        }
+    }
+}
+
+/// Astro view — planet sizing, sky layout and globe ring budget.
+///
+/// Note 010 §Configuration reserves `[astro]` for sizing clamps, ring budget,
+/// seed, transparency and pan/pinch thresholds; slice 4 lands the first three.
+/// The palette (`[astro.palette]`) belongs to the backdrop and arrives with
+/// slice 5.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct Astro {
+    /// Layout seed. The sky is deterministic — the same seed and the same
+    /// planet roster always produce the same positions, so the launcher's
+    /// muscle memory survives a restart. Change it to reshuffle.
+    pub seed: u64,
+    /// `radius = planet_base_radius_px * sqrt(app_count)`, then clamped to
+    /// `[planet_min_radius_px, planet_max_radius_px]`. On this device the
+    /// per-planet spread is 2–10 apps, i.e. sqrt 1.41–3.16.
+    pub planet_base_radius_px: f64,
+    pub planet_min_radius_px: f64,
+    pub planet_max_radius_px: f64,
+    /// Share of the astro rect the planet discs may cover. Above this every
+    /// radius shrinks by the same factor, so a big roster stays laid out
+    /// rather than overlapping.
+    pub fill_fraction: f64,
+    /// Globe icon size as a fraction of the planet radius, clamped. Icons are
+    /// foreshortened on top of this by their position on the sphere.
+    pub icon_ratio: f64,
+    pub icon_min_px: f64,
+    pub icon_max_px: f64,
+    /// Centre-to-centre icon spacing as a multiple of the icon size. Drives
+    /// both the ring budget and each ring's capacity.
+    pub ring_pitch_ratio: f64,
+    /// How far from the front pole (degrees) the rings may spread before
+    /// spilling onto the back of the globe. With `ring_pitch_ratio` this is
+    /// the "ring budget scales with planet size" rule of note 010: a globe
+    /// fits `radius * front_arc / pitch` rings on its front face.
+    pub front_arc_deg: f64,
+}
+
+impl Default for Astro {
+    fn default() -> Self {
+        Self {
+            seed: 1,
+            planet_base_radius_px: 34.0,
+            planet_min_radius_px: 40.0,
+            planet_max_radius_px: 104.0,
+            fill_fraction: 0.28,
+            icon_ratio: 0.34,
+            icon_min_px: 14.0,
+            icon_max_px: 30.0,
+            ring_pitch_ratio: 1.3,
+            front_arc_deg: 78.0,
         }
     }
 }

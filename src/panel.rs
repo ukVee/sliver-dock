@@ -19,8 +19,8 @@ use gtk4::{
 };
 use gtk4_layer_shell::{Edge, Layer, LayerShell};
 
-use crate::app_grid;
 use crate::apps::{self, AppEntry};
+use crate::astro;
 use crate::battery::{self, BatteryInfo, BatteryState};
 use crate::categories;
 use crate::config::{self, Animation, Geometry};
@@ -68,6 +68,7 @@ fn on_activate(app: &Application) {
         cfg.animation,
         cfg.terminal.clone(),
         cfg.behaviour,
+        cfg.astro,
         window.clone(),
         area.clone(),
     );
@@ -81,7 +82,7 @@ fn on_activate(app: &Application) {
     let drag_for_draw = Rc::clone(&drag);
     area.set_draw_func(move |_, ctx, w, h| {
         draw_bar(ctx, w as f64, h as f64, &geom, &anim, &drag_for_draw);
-        draw_app_grid_overlay(ctx, w as f64, h as f64, &geom, &drag_for_draw);
+        draw_astro_overlay(ctx, w as f64, h as f64, &geom, &drag_for_draw);
         // The astro sliver is the astro view's top border and paints last, on
         // top of the black backdrop it just pulled out from behind the dock.
         draw_astro_sliver(ctx, w as f64, h as f64, &geom, &drag_for_draw);
@@ -532,17 +533,16 @@ fn astro_rect(surface_w: f64, surface_h: f64, g: &Geometry) -> AstroRect {
 /// it *up* from its own bottom edge as `grid_amount` goes 0 → 1. Because it
 /// runs after `draw_bar`, it composites on top of the dock sections.
 ///
-/// SLICE 1 (astro-view): this is the geometry foundation. The backdrop is the
-/// new astro surface; the interim content is the existing radial app grid,
-/// re-centered into the rect so app-launch keeps working — planets + ASCII
-/// backdrop replace it in slices 4-5. Sliver fusion/travel is slice 2.
-fn draw_app_grid_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &Drag) {
+/// Contents as of slice 4: the planets, laid out by `astro::build_sky` and
+/// drawn as globes carrying real app icons. The interim re-centered radial
+/// grid slice 1 parked here is retired. The ASCII starfield behind them is
+/// slice 5; the black fill is its stand-in.
+fn draw_astro_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &Drag) {
     let v = drag.visual();
     let a = v.grid_amount;
     if a < 0.001 {
         return;
     }
-    let Some(state) = drag.grid_state() else { return };
 
     let rect = astro_rect(w, h, g);
     if rect.w <= 0.0 || rect.bottom <= rect.top {
@@ -568,16 +568,26 @@ fn draw_app_grid_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag:
     ctx.rectangle(rect.x, panel_top, rect.w, card_h);
     let _ = ctx.fill();
 
-    // Interim: the radial grid centered in the rect (replaced by planets in
-    // slice 4). The whole-grid fade rides on `a` so it appears with the panel.
-    let center_x = rect.x + rect.w / 2.0;
-    let center_y = (rect.top + rect.bottom) / 2.0;
-    let icon_loader = |id: &str, spec: Option<&str>| -> Option<(cairo::ImageSurface, f64)> {
-        let s = drag.app_icon(id, spec, 41)?;
-        Some((s, 41.0))
+    // The planets. They fade in on `a` with the panel; they don't move with
+    // it — the clip does the reveal, so the sky is already in place behind
+    // the extruding panel rather than sliding up into it.
+    let icon_loader = |id: &str, spec: Option<&str>, size: i32| -> Option<cairo::ImageSurface> {
+        drag.app_icon(id, spec, size)
     };
-    app_grid::draw_grid(ctx, &state, center_x, center_y, a, &icon_loader);
+    astro::draw_sky(ctx, &drag.sky(sky_rect(&rect)), a, 0.0, &icon_loader);
     ctx.restore().ok();
+}
+
+/// The astro rect as `astro.rs` wants it. One conversion point, so the
+/// renderer, the tap handler and `get-state` can never disagree about which
+/// rectangle the sky was solved for.
+fn sky_rect(rect: &AstroRect) -> astro::SkyRect {
+    astro::SkyRect {
+        x: rect.x,
+        y: rect.top,
+        w: rect.w,
+        h: (rect.bottom - rect.top).max(0.0),
+    }
 }
 
 /// Three placeholder section blocks staggered in detailed_amount space.
@@ -1431,21 +1441,14 @@ fn install_section_click_handler(
         let surface_h = area_for_size.height() as f64;
 
         if bar_state == BarState::AppGrid {
-            if let Some(state) = drag.grid_state() {
-                // Mirror draw_app_grid_overlay: the interim radial grid is
-                // centered in the astro rect (surface coords), so tap targets
-                // key off the same real-surface geometry.
-                let rect = astro_rect(surface_w, surface_h, &geom);
-                let center_x = rect.x + rect.w / 2.0;
-                let center_y = (rect.top + rect.bottom) / 2.0;
-                if let Some(entry) =
-                    app_grid::hit_test(x, y, &state, center_x, center_y, 1.0)
-                {
-                    handle_app_tap(&drag, &entry);
-                    if drag.auto_close_app_grid() {
-                        drag.snap_to_state(BarState::Detailed);
-                    }
-                    return;
+            // Same rect and the same cached sky the renderer drew, so a tap
+            // lands on the icon the user is looking at.
+            let rect = astro_rect(surface_w, surface_h, &geom);
+            let sky = drag.sky(sky_rect(&rect));
+            if let Some(entry) = astro::hit_test(x, y, &sky, 0.0) {
+                handle_app_tap(&drag, &entry);
+                if drag.auto_close_app_grid() {
+                    drag.snap_to_state(BarState::Detailed);
                 }
             }
             return;
@@ -2393,6 +2396,38 @@ mod tests {
         assert!(grid_y < detailed_y, "close handle must sit above the dock sliver");
     }
 
+    /// This device's live planet roster (note 013), so the dumped frames show
+    /// the sky the user actually gets rather than a toy one.
+    fn dump_roster() -> Vec<crate::categories::Planet> {
+        [
+            ("AudioVideo", 3),
+            ("Development", 2),
+            ("Game", 4),
+            ("Network", 10),
+            ("Settings", 2),
+            ("System", 9),
+            ("Utility", 6),
+            ("Other", 4),
+        ]
+        .into_iter()
+        .map(|(key, n)| crate::categories::Planet {
+            key: key.to_string(),
+            display_name: key.to_string(),
+            apps: (0..n)
+                .map(|i| AppEntry {
+                    id: format!("{key}-{i}"),
+                    name: format!("{key}-{i}"),
+                    icon: None,
+                    exec: None,
+                    no_display: false,
+                    hidden: false,
+                    categories: Vec::new(),
+                })
+                .collect(),
+        })
+        .collect()
+    }
+
     /// Visual aid, not an assertion: dumps the sliver assembly + backdrop at
     /// real device geometry to `$SLIVER_FRAME_DIR` (default `/tmp`), one
     /// binary PPM per travel frame (PPM keeps this dep-free — cairo's PNG
@@ -2431,6 +2466,16 @@ mod tests {
                     ctx.set_source_rgb(0.0, 0.0, 0.0);
                     rounded_rect_path(&ctx, rect.x, top, rect.w, rect.bottom - top, 12.0);
                     ctx.fill().unwrap();
+                    // The sky at real device geometry. Icons come out blank —
+                    // resolving them needs a live GTK IconTheme — but the
+                    // planet layout (positions, sqrt sizing, spread, labels)
+                    // is exactly what needs eyeballing and it renders here.
+                    let sky = astro::build_sky(
+                        &dump_roster(),
+                        &config::Astro::default(),
+                        sky_rect(&rect),
+                    );
+                    astro::draw_sky(&ctx, &sky, v.grid_amount, 0.0, &|_, _, _| None);
                 }
 
                 let bar_w = (g.width_px as f64).min(SURFACE_W);

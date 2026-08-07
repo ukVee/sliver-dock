@@ -13,7 +13,7 @@
 //! All methods run on the GTK main thread.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -22,11 +22,12 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{ApplicationWindow, DrawingArea};
 
-use crate::app_grid;
 use crate::apps::{self, AppEntry};
+use crate::astro;
 use crate::battery::BatteryInfo;
 use crate::categories::Planet;
-use crate::config::{Animation, Behaviour, Geometry, Terminal};
+use crate::config::{Animation, Astro, Behaviour, Geometry, Terminal};
+use crate::launches;
 use crate::cpu::CpuInfo;
 use crate::state::{BarState, WorkspaceId};
 use crate::wayfire::GridSize;
@@ -133,10 +134,16 @@ pub struct Drag {
     /// Wayfire and needs to resolve them to icon paths regardless of
     /// whether the entry would show in the apps section.
     app_registry: RefCell<HashMap<String, AppEntry>>,
-    /// Lazy-populated icon surface cache, keyed by app id. `None` value
-    /// means we tried to load the icon and it failed — we cache the miss
-    /// so we don't retry on every frame.
-    icon_cache: RefCell<HashMap<String, Option<cairo::ImageSurface>>>,
+    /// Lazy-populated icon surface cache, keyed by **app id and pixel size**.
+    /// A `None` value means we tried to load the icon and it failed — we cache
+    /// the miss so we don't retry on every frame.
+    ///
+    /// The size is part of the key because consumers ask for different ones:
+    /// the dock row loads at its cell width, the workspace montage at
+    /// `ICON_SIZE`, and each astro planet at its own globe icon size (which
+    /// scales with the planet). Keyed by id alone, whichever consumer drew
+    /// first would pin the resolution for every other one.
+    icon_cache: RefCell<HashMap<(String, i32), Option<cairo::ImageSurface>>>,
     /// Set of app-ids with at least one mapped toplevel view. Driven by
     /// the wayfire `RunningAppsChanged` event. Apps section filters out
     /// any entry whose id is in this set (v1-plan: "running apps disappear
@@ -196,11 +203,19 @@ pub struct Drag {
     launching_started_at: Cell<Option<Instant>>,
     launching_animation: RefCell<Option<glib::SourceId>>,
     launch_counts: RefCell<HashMap<String, u64>>,
-    grid_state: RefCell<Option<app_grid::GridState>>,
-    /// Astro-view planets — the visible roster grouped by category, ordered
-    /// most-launched-first within each. Built from the same roster the apps
-    /// row uses; slice 4 lays these out as globes.
+    /// Astro-view planets — the launchable roster grouped by category, ordered
+    /// most-launched-first within each. Set once at startup by
+    /// `panel::load_apps_into`.
     planets: RefCell<Vec<Planet>>,
+    /// Astro sizing / seed / ring-budget knobs.
+    astro: Astro,
+    /// The laid-out sky, cached against the rect it was solved for. Layout is
+    /// deterministic, so this is pure memoisation — it exists because the
+    /// astro view redraws on a 16ms ticker and re-solving placement (and
+    /// re-cloning every globe's app list) per frame would be wasted work on a
+    /// Surface Go 3. Dropped whenever the roster changes; re-solved when the
+    /// surface resizes.
+    sky: RefCell<Option<Rc<astro::Sky>>>,
 }
 
 impl Drag {
@@ -209,6 +224,7 @@ impl Drag {
         anim: Animation,
         terminal: Terminal,
         behaviour: Behaviour,
+        astro: Astro,
         window: ApplicationWindow,
         area: DrawingArea,
     ) -> Rc<Self> {
@@ -244,8 +260,9 @@ impl Drag {
             launching_started_at: Cell::new(None),
             launching_animation: RefCell::new(None),
             launch_counts: RefCell::new(HashMap::new()),
-            grid_state: RefCell::new(None),
             planets: RefCell::new(Vec::new()),
+            astro,
+            sky: RefCell::new(None),
         })
     }
 
@@ -359,7 +376,30 @@ impl Drag {
 
     pub fn set_planets(&self, planets: Vec<Planet>) {
         *self.planets.borrow_mut() = planets;
+        *self.sky.borrow_mut() = None;
         self.area.queue_draw();
+    }
+
+    /// The sky laid out for `rect`, solving it on first use and on any change
+    /// of rect. Shared by the renderer, the tap handler and `get-state`, so
+    /// all three read one layout rather than three that could drift.
+    ///
+    /// This is the accessor slice 4 needed — not the bare `planets()` the
+    /// slice-3 handoff predicted. Layout lives behind this method so the
+    /// roster and the geometry can't be read apart and re-solved twice; a
+    /// public `planets()` would have no caller.
+    pub fn sky(&self, rect: astro::SkyRect) -> Rc<astro::Sky> {
+        let cached = self.sky.borrow().clone();
+        if let Some(sky) = cached.filter(|s| s.rect == rect) {
+            return sky;
+        }
+        let built = Rc::new(astro::build_sky(
+            &self.planets.borrow(),
+            &self.astro,
+            rect,
+        ));
+        *self.sky.borrow_mut() = Some(Rc::clone(&built));
+        built
     }
 
     pub fn set_apps(&self, apps: Vec<AppEntry>) {
@@ -485,13 +525,12 @@ impl Drag {
         icon_spec: Option<&str>,
         size: i32,
     ) -> Option<cairo::ImageSurface> {
-        if let Some(cached) = self.icon_cache.borrow().get(id) {
+        let key = (id.to_owned(), size);
+        if let Some(cached) = self.icon_cache.borrow().get(&key) {
             return cached.clone();
         }
         let surface = icon_spec.and_then(|s| apps::load_icon_surface(s, size));
-        self.icon_cache
-            .borrow_mut()
-            .insert(id.to_owned(), surface.clone());
+        self.icon_cache.borrow_mut().insert(key, surface.clone());
         surface
     }
 
@@ -509,7 +548,8 @@ impl Drag {
     /// (a running app whose .desktop entry wasn't scanned) cache as a
     /// miss so we don't retry on every frame.
     pub fn app_icon_by_id(&self, id: &str, size: i32) -> Option<cairo::ImageSurface> {
-        if let Some(cached) = self.icon_cache.borrow().get(id) {
+        let key = (id.to_owned(), size);
+        if let Some(cached) = self.icon_cache.borrow().get(&key) {
             return cached.clone();
         }
         let spec = self
@@ -518,9 +558,7 @@ impl Drag {
             .get(id)
             .and_then(|e| e.icon.clone());
         let surface = spec.as_deref().and_then(|s| apps::load_icon_surface(s, size));
-        self.icon_cache
-            .borrow_mut()
-            .insert(id.to_owned(), surface.clone());
+        self.icon_cache.borrow_mut().insert(key, surface.clone());
         surface
     }
 
@@ -562,7 +600,7 @@ impl Drag {
             })
             .collect();
         format!(
-            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"planets":[{}]}}"#,
+            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"planets":[{}],"sky":{}}}"#,
             self.state.get().as_str(),
             v.hidden_amount,
             v.detailed_amount,
@@ -572,7 +610,45 @@ impl Drag {
             ws.x,
             ws.y,
             entries.join(","),
-            planets.join(",")
+            planets.join(","),
+            self.dump_sky(),
+        )
+    }
+
+    /// The solved astro layout, or `{"built":false}` before the view has been
+    /// drawn once (the sky is solved lazily, against the real surface). This
+    /// is the only way to check planet placement on this device: screencopy
+    /// fails in this compositor session, so open the astro view over IPC
+    /// (`drag-begin up-grid` → `drag 1` → `drag-end 1 1`) and read it back
+    /// here.
+    fn dump_sky(&self) -> String {
+        let Some(sky) = self.sky.borrow().clone() else {
+            return r#"{"built":false}"#.to_owned();
+        };
+        let bodies: Vec<String> = sky
+            .planets
+            .iter()
+            .map(|p| {
+                format!(
+                    r#"{{"key":"{}","x":{:.1},"y":{:.1},"r":{:.1},"icon":{:.1},"rings":{},"front":{},"back":{}}}"#,
+                    json_escape(&p.key),
+                    p.cx,
+                    p.cy,
+                    p.radius,
+                    p.icon_px,
+                    p.front_rings,
+                    p.placed_icons(0.0).len(),
+                    p.back_count(0.0),
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"built":true,"rect":{{"x":{:.1},"y":{:.1},"w":{:.1},"h":{:.1}}},"bodies":[{}]}}"#,
+            sky.rect.x,
+            sky.rect.y,
+            sky.rect.w,
+            sky.rect.h,
+            bodies.join(",")
         )
     }
 
@@ -602,9 +678,6 @@ impl Drag {
         self.set_visual(target.into());
         self.save_current_workspace();
         self.apply_visibility();
-        if target == BarState::AppGrid {
-            self.rebuild_grid();
-        }
         update_zone_states(target, &self.geom);
         self.refresh_input_region();
     }
@@ -709,9 +782,6 @@ impl Drag {
         self.state.set(target);
         self.set_visual(target.into());
         self.save_current_workspace();
-        if target == BarState::AppGrid {
-            self.rebuild_grid();
-        }
         self.apply_visibility();
         update_zone_states(target, &self.geom);
         self.refresh_input_region();
@@ -741,7 +811,7 @@ impl Drag {
     }
 
     pub fn load_launches(&self) {
-        let counts = app_grid::load_launches();
+        let counts = launches::load();
         *self.launch_counts.borrow_mut() = counts;
     }
 
@@ -754,33 +824,9 @@ impl Drag {
             let mut counts = self.launch_counts.borrow_mut();
             *counts.entry(id.to_owned()).or_insert(0) += 1;
         }
-        if let Err(e) = app_grid::save_launches(&self.launch_counts.borrow()) {
+        if let Err(e) = launches::save(&self.launch_counts.borrow()) {
             eprintln!("sliver-dock: failed to save launches: {e}");
         }
-    }
-
-    pub fn rebuild_grid(&self) {
-        let registry = self.app_registry.borrow();
-        let counts = self.launch_counts.borrow();
-        if registry.is_empty() {
-            return;
-        }
-        let entries_map: BTreeMap<String, AppEntry> = registry.clone().into_iter().collect();
-        let g = &self.geom;
-        let bar_w = g.width_px as f64;
-        let tip_len = g.default_height_px as f64 * 6.0;
-        let grid_w = (bar_w - 2.0 * tip_len).max(0.0);
-        let state = app_grid::build_grid(
-            &entries_map,
-            &counts,
-            grid_w,
-            g.grid_height_px as f64,
-        );
-        *self.grid_state.borrow_mut() = Some(state);
-    }
-
-    pub fn grid_state(&self) -> Option<app_grid::GridState> {
-        self.grid_state.borrow().clone()
     }
 
     /// Apply the latest fullscreen-workspace set from Wayfire. No-op when
@@ -902,9 +948,6 @@ impl Drag {
             direction,
         }));
         self.ensure_mapped();
-        if target == BarState::AppGrid {
-            self.rebuild_grid();
-        }
         self.set_visual(Visual::from(source));
         self.refresh_input_region();
     }
