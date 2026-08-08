@@ -68,7 +68,7 @@ fn on_activate(app: &Application) {
         cfg.animation,
         cfg.terminal.clone(),
         cfg.behaviour,
-        cfg.astro,
+        cfg.astro.clone(),
         window.clone(),
         area.clone(),
     );
@@ -586,10 +586,11 @@ fn astro_rect(surface_w: f64, surface_h: f64, g: &Geometry) -> AstroRect {
 /// it *up* from its own bottom edge as `grid_amount` goes 0 → 1. Because it
 /// runs after `draw_bar`, it composites on top of the dock sections.
 ///
-/// Contents as of slice 4: the planets, laid out by `astro::build_sky` and
-/// drawn as globes carrying real app icons. The interim re-centered radial
-/// grid slice 1 parked here is retired. The ASCII starfield behind them is
-/// slice 5; the black fill is its stand-in.
+/// Contents as of slice 5, painted back to front: the ASCII backdrop (its own
+/// background fill, the baked starfield + nebulas, and any shooting star in
+/// flight), then the planets — globes carrying real app icons, laid out by
+/// `astro::build_sky`. The interim re-centered radial grid slice 1 parked
+/// here is retired.
 fn draw_astro_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &Drag) {
     let v = drag.visual();
     let a = v.grid_amount;
@@ -604,7 +605,7 @@ fn draw_astro_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &D
     let corner = 12.0;
 
     // The panel is *pulled out* by the astro sliver: its top edge is the
-    // sliver's top edge, so the black extrudes from behind the travelling
+    // sliver's top edge, so the backdrop extrudes from behind the travelling
     // sliver rather than animating on its own clock (note 010 §Transition).
     // Clamped to the rect bottom for the Closed → AppGrid path, where the
     // sliver starts below the rect (the dock is still un-lifted). The rounded
@@ -617,17 +618,19 @@ fn draw_astro_overlay(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &D
     rounded_rect_path(ctx, rect.x, panel_top, rect.w, card_h, corner);
     ctx.clip();
 
-    ctx.set_source_rgba(0.0, 0.0, 0.0, 1.0);
-    ctx.rectangle(rect.x, panel_top, rect.w, card_h);
-    let _ = ctx.fill();
+    // Backdrop, then planets. Both are laid out for the whole rect and fade
+    // in on `a`; neither moves with the panel — the clip does the reveal, so
+    // the sky is already in place behind the extruding panel rather than
+    // sliding up into it. The backdrop paints its own background over the
+    // full rect (the clip trims it), which is why there is no separate fill
+    // here any more.
+    let sky = sky_rect(&rect);
+    drag.backdrop(sky).draw(ctx, a, drag.astro_clock());
 
-    // The planets. They fade in on `a` with the panel; they don't move with
-    // it — the clip does the reveal, so the sky is already in place behind
-    // the extruding panel rather than sliding up into it.
     let icon_loader = |id: &str, spec: Option<&str>, size: i32| -> Option<cairo::ImageSurface> {
         drag.app_icon(id, spec, size)
     };
-    astro::draw_sky(ctx, &drag.sky(sky_rect(&rect)), a, 0.0, &icon_loader);
+    astro::draw_sky(ctx, &drag.sky(sky), a, 0.0, &icon_loader);
     ctx.restore().ok();
 }
 
@@ -2083,6 +2086,7 @@ fn _visibility_guard() -> Rc<Cell<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backdrop;
     use crate::state::WorkspaceId;
     use std::collections::HashSet;
 
@@ -2496,6 +2500,15 @@ mod tests {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // Ambient clock the frames are rendered at. `SLIVER_FRAME_T=<secs>`
+        // moves it, which is how the shooting star gets dumped: it flies for
+        // `shooting_star_duration_s` at the top of every
+        // `shooting_star_period_s`, so `SLIVER_FRAME_T=0.45` catches one
+        // mid-crossing and the default 0.0 catches it at launch.
+        let clock: f64 = std::env::var("SLIVER_FRAME_T")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0.0);
         for (name, v) in [
             ("fused-closed".to_string(), visual(0.0, 0.0)),
             ("fused-detailed".to_string(), visual(1.0, 0.0)),
@@ -2520,20 +2533,23 @@ mod tests {
                 let rect = astro_rect(SURFACE_W, SURFACE_H, &g);
                 let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &v);
                 if v.grid_amount > 0.0 {
+                    let cfg = config::Astro::default();
                     let top = s.astro_top.min(rect.bottom);
-                    ctx.set_source_rgb(0.0, 0.0, 0.0);
+                    ctx.save().unwrap();
                     rounded_rect_path(&ctx, rect.x, top, rect.w, rect.bottom - top, 12.0);
-                    ctx.fill().unwrap();
+                    ctx.clip();
+                    // Backdrop then planets, the live draw order. `clock` is
+                    // the ambient time the frame is rendered at, so a shooting
+                    // star can be dumped by asking for one mid-flight.
+                    backdrop::Backdrop::build(&cfg, sky_rect(&rect))
+                        .draw(&ctx, v.grid_amount, clock);
                     // The sky at real device geometry. Icons come out blank —
                     // resolving them needs a live GTK IconTheme — but the
                     // planet layout (positions, sqrt sizing, spread, labels)
                     // is exactly what needs eyeballing and it renders here.
-                    let sky = astro::build_sky(
-                        &dump_roster(),
-                        &config::Astro::default(),
-                        sky_rect(&rect),
-                    );
+                    let sky = astro::build_sky(&dump_roster(), &cfg, sky_rect(&rect));
                     astro::draw_sky(&ctx, &sky, v.grid_amount, 0.0, &|_, _, _| None);
+                    ctx.restore().unwrap();
                 }
 
                 let bar_w = (g.width_px as f64).min(SURFACE_W);

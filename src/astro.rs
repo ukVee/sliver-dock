@@ -27,20 +27,7 @@ use gtk4::cairo;
 
 use crate::apps::AppEntry;
 use crate::categories::Planet;
-use crate::config::Astro;
-
-/// Tokyo Night planet accents from note 010 §Configuration (`#7aa2f7`,
-/// `#bb9af7`, `#7dcfff`), assigned round-robin in roster order so a planet
-/// keeps its colour across restarts. Slice 5 lifts the palette into a
-/// config-driven `[astro.palette]` alongside the backdrop colours.
-const ACCENTS: [(f64, f64, f64); 3] = [
-    (0.478, 0.635, 0.969),
-    (0.733, 0.604, 0.969),
-    (0.490, 0.812, 1.000),
-];
-
-/// Note 010's star colour `#c0caf5`, used for planet labels.
-const LABEL_RGB: (f64, f64, f64) = (0.753, 0.792, 0.961);
+use crate::config::{Astro, Palette};
 
 /// Candidate positions drawn per planet in the seeded placement pass. Each
 /// planet takes the candidate that maximises its clearance, so more candidates
@@ -112,7 +99,8 @@ pub struct PlanetBody {
     pub icon_px: f64,
     /// Rings this globe fits on its front face. The "ring budget" of note 010.
     pub front_rings: usize,
-    /// Index into [`ACCENTS`].
+    /// Index into the palette's `planet_accents`, assigned in roster order so
+    /// a planet keeps its colour across restarts.
     pub accent: usize,
     /// Most-launched first, so `apps[0]` is the front pole.
     pub apps: Vec<GlobeApp>,
@@ -125,6 +113,10 @@ pub struct PlanetBody {
 pub struct Sky {
     pub rect: SkyRect,
     pub planets: Vec<PlanetBody>,
+    /// The colours this sky was solved against (`[astro.palette]`). Carried
+    /// on the layout rather than passed to the renderer so the accent index
+    /// and the accent list can never come from two different configs.
+    pub palette: Palette,
 }
 
 /// One globe icon projected to the screen for a given spin.
@@ -194,14 +186,19 @@ fn label_block(radius: f64) -> f64 {
 /// layout seed; this is a few lines, has good distribution, and is stable
 /// across builds and machines — which is exactly what "same sky every open"
 /// requires.
-struct Rng(u64);
+///
+/// Shared with `backdrop.rs` (slice 5), which seeds it off the same
+/// `[astro] seed` for the starfield and — because SplitMix64's finaliser is
+/// a good avalanche on its own — uses it as the lattice hash behind the
+/// nebula noise. One PRNG in the crate, one place for determinism to break.
+pub(crate) struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub(crate) fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -210,7 +207,7 @@ impl Rng {
     }
 
     /// Uniform in `[0, 1)`.
-    fn next_f64(&mut self) -> f64 {
+    pub(crate) fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 }
@@ -221,14 +218,17 @@ pub fn build_sky(planets: &[Planet], cfg: &Astro, rect: SkyRect) -> Sky {
         return Sky {
             rect,
             planets: Vec::new(),
+            palette: cfg.palette.clone(),
         };
     }
 
     let radii = solve_radii(planets, cfg, rect);
     let centres = place(&radii, cfg.seed, rect);
+    let accents = cfg.palette.accent_count();
 
     Sky {
         rect,
+        palette: cfg.palette.clone(),
         planets: planets
             .iter()
             .zip(radii)
@@ -244,7 +244,7 @@ pub fn build_sky(planets: &[Planet], cfg: &Astro, rect: SkyRect) -> Sky {
                     radius,
                     icon_px,
                     front_rings,
-                    accent: i % ACCENTS.len(),
+                    accent: i % accents,
                     apps,
                 }
             })
@@ -460,13 +460,14 @@ pub fn draw_sky(
         return;
     }
     for body in &sky.planets {
-        draw_planet(ctx, body, alpha, spin, icon_loader);
+        draw_planet(ctx, body, &sky.palette, alpha, spin, icon_loader);
     }
 }
 
 fn draw_planet(
     ctx: &cairo::Context,
     body: &PlanetBody,
+    palette: &Palette,
     alpha: f64,
     spin: f64,
     icon_loader: &IconLoader<'_>,
@@ -474,7 +475,7 @@ fn draw_planet(
     if body.radius < 1.0 {
         return;
     }
-    let (r, g, b) = ACCENTS[body.accent % ACCENTS.len()];
+    let (r, g, b) = palette.accent(body.accent).tuple();
 
     // Sphere shading: lit from the upper left, falling away to a dark rim.
     // Cheap (one gradient per planet per frame) and it is what makes a flat
@@ -533,10 +534,10 @@ fn draw_planet(
         ctx.restore().ok();
     }
 
-    draw_label(ctx, body, alpha);
+    draw_label(ctx, body, palette, alpha);
 }
 
-fn draw_label(ctx: &cairo::Context, body: &PlanetBody, alpha: f64) {
+fn draw_label(ctx: &cairo::Context, body: &PlanetBody, palette: &Palette, alpha: f64) {
     let size = label_px(body.radius);
     ctx.save().ok();
     ctx.select_font_face(
@@ -548,7 +549,8 @@ fn draw_label(ctx: &cairo::Context, body: &PlanetBody, alpha: f64) {
     if let Ok(ext) = ctx.text_extents(&body.display_name) {
         let tx = body.cx - ext.width() / 2.0 - ext.x_bearing();
         let ty = body.cy + body.radius + LABEL_GAP - ext.y_bearing();
-        ctx.set_source_rgba(LABEL_RGB.0, LABEL_RGB.1, LABEL_RGB.2, 0.92 * alpha);
+        let (r, g, b) = palette.label.tuple();
+        ctx.set_source_rgba(r, g, b, 0.92 * alpha);
         ctx.move_to(tx, ty);
         let _ = ctx.show_text(&body.display_name);
     }

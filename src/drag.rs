@@ -24,6 +24,7 @@ use gtk4::{ApplicationWindow, DrawingArea};
 
 use crate::apps::{self, AppEntry};
 use crate::astro;
+use crate::backdrop;
 use crate::battery::BatteryInfo;
 use crate::categories::Planet;
 use crate::config::{Animation, Astro, Behaviour, Geometry, Terminal};
@@ -47,6 +48,22 @@ const LAUNCH_SPINNER_PERIOD_MS: u64 = 900;
 /// `queue_draw` cost modest while the icon is also rendering at the bar's
 /// own redraw cadence.
 const LAUNCH_SPINNER_TICK_MS: u64 = 33;
+
+/// Frame cadence while the astro backdrop has something moving — the same
+/// 16ms the open/close animation runs at (note 010 slice 5: "cheap ambient
+/// animation, 16ms ticker reused").
+///
+/// It is only ever armed at this rate *during* a shooting star. Between them
+/// the timer sleeps to the next one instead of polling, because the starfield
+/// is static and there is nothing to ask: an idle 60Hz tick measured ~7% of a
+/// core on this device, all of it spent deciding not to draw.
+const ASTRO_FRAME_MS: u64 = 16;
+
+/// Ceiling on an idle sleep. The gap between shooting stars is usually the
+/// whole `shooting_star_period_s`; capping the nap keeps the animation from
+/// parking indefinitely if that ever computes wrong, at a cost of one wakeup
+/// every two seconds.
+const ASTRO_IDLE_SLEEP_MAX_MS: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Direction {
@@ -216,6 +233,21 @@ pub struct Drag {
     /// Surface Go 3. Dropped whenever the roster changes; re-solved when the
     /// surface resizes.
     sky: RefCell<Option<Rc<astro::Sky>>>,
+    /// The ASCII backdrop behind the planets, cached against its rect on the
+    /// same terms as `sky`. It also memoises a baked glyph layer internally,
+    /// so dropping this entry is what forces a re-bake on a surface resize.
+    backdrop: RefCell<Option<Rc<backdrop::Backdrop>>>,
+    /// The astro view's ambient animation, live only while the view is on
+    /// screen. `Some` ⇔ a wakeup is armed.
+    astro_animation: RefCell<Option<glib::SourceId>>,
+    /// Whether the previous ambient step had a shooting star in flight, so
+    /// the step after one lands can redraw once to clear it.
+    astro_was_animating: Cell<bool>,
+    /// Start of the backdrop's own monotonic clock. Taken once at
+    /// construction rather than at each open, so the sky keeps running while
+    /// the launcher is closed and a meteor doesn't fire at the same beat
+    /// after every swipe-up.
+    created_at: Instant,
 }
 
 impl Drag {
@@ -263,6 +295,10 @@ impl Drag {
             planets: RefCell::new(Vec::new()),
             astro,
             sky: RefCell::new(None),
+            backdrop: RefCell::new(None),
+            astro_animation: RefCell::new(None),
+            astro_was_animating: Cell::new(false),
+            created_at: Instant::now(),
         })
     }
 
@@ -378,6 +414,98 @@ impl Drag {
         *self.planets.borrow_mut() = planets;
         *self.sky.borrow_mut() = None;
         self.area.queue_draw();
+    }
+
+    /// Seconds on the backdrop's ambient clock. Monotonic and process-wide —
+    /// see `created_at`.
+    pub fn astro_clock(&self) -> f64 {
+        self.created_at.elapsed().as_secs_f64()
+    }
+
+    /// The backdrop generated for `rect`, built on first use and on any change
+    /// of rect. Same memoisation contract as [`Self::sky`]: generation is
+    /// deterministic, so this is pure caching — but it also holds the baked
+    /// glyph layer, which is what the 16ms redraw actually depends on.
+    pub fn backdrop(&self, rect: astro::SkyRect) -> Rc<backdrop::Backdrop> {
+        let cached = self.backdrop.borrow().clone();
+        if let Some(b) = cached.filter(|b| b.rect == rect) {
+            return b;
+        }
+        let built = Rc::new(backdrop::Backdrop::build(&self.astro, rect));
+        *self.backdrop.borrow_mut() = Some(Rc::clone(&built));
+        built
+    }
+
+    /// Run the ambient animation while the astro view is on screen, and only
+    /// then. Started and stopped from `set_visual`, so it follows the view
+    /// through drags, snaps and workspace switches alike rather than needing
+    /// a hook at each entry point.
+    ///
+    /// The tick redraws only when the backdrop has something in flight; an
+    /// open-but-idle astro view issues no `queue_draw` at all.
+    fn start_astro_animation(self: &Rc<Self>) {
+        if self.astro_animation.borrow().is_some() {
+            return;
+        }
+        self.astro_was_animating.set(false);
+        self.arm_astro_frame(Duration::from_millis(ASTRO_FRAME_MS));
+    }
+
+    /// Arm the next ambient wakeup. The cadence is the *result* of each step:
+    /// frame rate while a shooting star crosses, a sleep to the next one when
+    /// the sky is still, and nothing at all when shooting stars are off.
+    ///
+    /// The source is only replaced when the cadence changes — a whole meteor
+    /// runs on one repeating source, so re-arming is a per-transition cost,
+    /// not a per-frame one.
+    fn arm_astro_frame(self: &Rc<Self>, delay: Duration) {
+        let this = Rc::clone(self);
+        let delay_ms = delay.as_millis();
+        let id = glib::timeout_add_local(delay, move || match this.astro_frame() {
+            Some(next) if next.as_millis() == delay_ms => glib::ControlFlow::Continue,
+            Some(next) => {
+                // Stores the newly armed source id over this one *before* this
+                // source is dropped, so what's stored is always live and
+                // `stop_astro_animation` never removes a dead id.
+                this.arm_astro_frame(next);
+                glib::ControlFlow::Break
+            }
+            None => {
+                this.astro_animation.borrow_mut().take();
+                glib::ControlFlow::Break
+            }
+        });
+        *self.astro_animation.borrow_mut() = Some(id);
+    }
+
+    /// One ambient step: redraw if the backdrop has — or just had — something
+    /// moving, and report how long until it is worth looking again. `None`
+    /// retires the animation entirely.
+    fn astro_frame(&self) -> Option<Duration> {
+        let Some(backdrop) = self.backdrop.borrow().clone() else {
+            // The view hasn't drawn its first frame, so there is no backdrop
+            // to ask yet. Come back at frame rate; the first draw builds it.
+            return Some(Duration::from_millis(ASTRO_FRAME_MS));
+        };
+        let t = self.astro_clock();
+        let animating = backdrop.is_animating(t);
+        // The trailing frame after `astro_was_animating` is what *clears* the
+        // last streak. Without it the meteor's final position stays painted
+        // until something else happens to redraw the dock.
+        if animating || self.astro_was_animating.get() {
+            self.area.queue_draw();
+        }
+        self.astro_was_animating.set(animating);
+
+        let wait_s = backdrop.seconds_until_next(t)?;
+        let ms = (wait_s * 1000.0).clamp(0.0, ASTRO_IDLE_SLEEP_MAX_MS as f64) as u64;
+        Some(Duration::from_millis(ms.max(ASTRO_FRAME_MS)))
+    }
+
+    fn stop_astro_animation(&self) {
+        if let Some(id) = self.astro_animation.borrow_mut().take() {
+            id.remove();
+        }
     }
 
     /// The sky laid out for `rect`, solving it on first use and on any change
@@ -662,8 +790,17 @@ impl Drag {
         }
     }
 
-    fn set_visual(&self, v: Visual) {
+    /// Set the render parameters and keep the ambient animation in step with
+    /// them. Every path that changes the view — drag, snap, jump, settle —
+    /// goes through here, so the backdrop's ticker starts and stops in one
+    /// place instead of being hooked onto each of them.
+    fn set_visual(self: &Rc<Self>, v: Visual) {
         self.visual.set(v);
+        if v.grid_amount > 0.001 {
+            self.start_astro_animation();
+        } else {
+            self.stop_astro_animation();
+        }
         self.area.queue_draw();
     }
 
@@ -673,7 +810,7 @@ impl Drag {
         self.workspaces.borrow_mut().insert(ws, s);
     }
 
-    fn settle(&self, target: BarState) {
+    fn settle(self: &Rc<Self>, target: BarState) {
         self.state.set(target);
         self.set_visual(target.into());
         self.save_current_workspace();

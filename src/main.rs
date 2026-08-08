@@ -5,6 +5,7 @@
 
 mod apps;
 mod astro;
+mod backdrop;
 mod battery;
 mod categories;
 mod config;
