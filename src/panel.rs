@@ -330,10 +330,10 @@ fn draw_bar(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, a: &Animation, dra
     let bar_top = bar_bot - bar_h;
     let cut_y = (bar_top + bar_bot) / 2.0;
 
-    // detailed_amount lifts the top half off the cut, opening a gap that
-    // future phases will fill with section content. At amount = 0 the two
-    // halves meet exactly at cut_y and reproduce the unsplit silhouette.
-    let lift = v.detailed_amount * g.detailed_content_height_px as f64;
+    // detailed_amount lifts the top half off the cut, opening a gap filled
+    // with the section content. At amount = 0 the two halves meet exactly at
+    // cut_y and reproduce the unsplit silhouette. The lift itself lives in
+    // `sliver_stack`, which owns everything above the cut.
     let alpha = 0.92 * (1.0 - v.hidden_amount);
 
     // Sections render *before* the bar halves so the bottom-half edge
@@ -360,38 +360,22 @@ fn draw_bar(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, a: &Animation, dra
     bottom_half_path(ctx, bar_left, bar_w, bar_h, cut_y, bar_bot, slope);
     let _ = ctx.fill();
 
-    top_half_path(
-        ctx,
-        bar_left,
-        bar_w,
-        bar_h,
-        bar_top - lift,
-        cut_y - lift,
-        slope,
-    );
-    let _ = ctx.fill();
-
     if v.hidden_amount < 0.999 {
-        // The dock sliver rides up with the detailed lift so it caps the *top*
-        // of the detailed view (screen `h - D`) instead of floating at the
-        // resting bar position. At detailed_amount = 1 this lands exactly on
-        // the astro-view bottom border (`bar_top - lift == h - D`), so the
-        // dock sliver *is* the astro view's bottom border — see note 010
-        // §Frame spec (Detailed position amended 2026-08-05: top of the
-        // detailed view, superseding "sits on the main bar").
+        // Everything above the section cut is ONE shape. The dock sliver rides
+        // up with the detailed lift so it caps the *top* of the detailed view
+        // (screen `h - D`) rather than floating at the resting bar position; at
+        // detailed_amount = 1 it lands exactly on the astro-view bottom border
+        // — note 010 §Frame spec, amended 2026-08-05. The bar's top half sits
+        // directly under it and the astro sliver directly above, so all three
+        // are drawn as a single spear while they touch: three separately tipped
+        // spears stacked showed three tapers where the silhouette should read
+        // as one blade.
         let stack = sliver_stack(w, h, g, &v);
         ctx.set_source_rgba(0.05, 0.05, 0.05, alpha);
-        spear_path(
-            ctx,
-            bar_left,
-            bar_w,
-            stack.dock_top,
-            stack.dock_bot,
-            stack.tip_len,
-            stack.dock_tip_y,
-            slope,
-        );
-        let _ = ctx.fill();
+        // Tip on the bottom edge: the cut line runs tip-to-tip so the sections
+        // extruding from it stay capped at their corners.
+        let piece = stack.assembly().unwrap_or(stack.lower);
+        fill_sliver(ctx, bar_left, bar_w, &piece, slope);
     }
 }
 
@@ -407,19 +391,14 @@ fn draw_astro_sliver(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &Dr
     let bar_w = (g.width_px as f64).min(w);
     let bar_left = (w - bar_w) / 2.0;
     let stack = sliver_stack(w, h, g, &v);
+    if stack.fused {
+        // Still resting on the dock: `draw_bar` already painted it as part of
+        // the one fused spear.
+        return;
+    }
 
     ctx.set_source_rgba(0.05, 0.05, 0.05, 0.92 * (1.0 - v.hidden_amount));
-    spear_path(
-        ctx,
-        bar_left,
-        bar_w,
-        stack.astro_top,
-        stack.astro_bot,
-        stack.tip_len,
-        stack.astro_tip_y,
-        g.taper_slope,
-    );
-    let _ = ctx.fill();
+    fill_sliver(ctx, bar_left, bar_w, &stack.astro, g.taper_slope);
 }
 
 /// Separation (px) over which the fused pair resolves into two independent
@@ -427,32 +406,90 @@ fn draw_astro_sliver(ctx: &CairoContext, w: f64, h: f64, g: &Geometry, drag: &Dr
 /// enough that the tips morph instead of popping.
 const SLIVER_SPLIT_PX: f64 = 24.0;
 
-/// Vertical geometry of the two slivers for the current frame, plus the tip
-/// shape that fuses or splits them.
+/// Vertical geometry of everything above the section cut for the current
+/// frame, plus the tip shape that fuses or splits it.
 ///
-/// **Fused (`grid_amount == 0`).** The astro sliver sits directly on the dock
-/// sliver and both are drawn with a tip derived from their *combined* 12px
-/// height (`tip_len = 12 · 6`), each tipping at the shared edge between them:
-/// their union is exactly one 12px spear. Drawing two independently tipped 6px
-/// spears stacked instead pinches back to the body width at the junction — the
-/// misaligned bowtie note 010 §Frame spec calls out.
+/// **Fused (`grid_amount == 0`).** The astro sliver, the dock sliver and the
+/// main bar's lifted top half are all adjacent, and are drawn as ONE spear
+/// spanning `astro_top..lower_bot` — 2.5 slivers tall, `tip_len` that height at
+/// the 6x ratio, tipping on its bottom edge. That bottom edge is the section
+/// cut line, which `draw_sections` lays sections out along tip-to-tip, so it
+/// has to stay full width. The result is a single monotonic taper: exactly one
+/// blade. Drawing the three as separately tipped spears instead stacks three
+/// tapers, which is what the user reported on 2026-08-07 ("an additional taper
+/// upwards") — and, at a shared junction, is the misaligned bowtie note 010
+/// §Frame spec calls out.
 ///
-/// **Splitting (`grid_amount` opening).** The astro sliver travels from the
-/// fused position up to the astro rect's top border, and the shared tip
-/// splits: over the first [`SLIVER_SPLIT_PX`] of separation each half's tip
-/// slides from the shared edge to its own mid-line while `tip_len` relaxes
-/// from the fused 72px to a lone sliver's 36px. The fused spear *becomes* two
-/// spears continuously — no pop at the moment of separation. The dock sliver
-/// stays put as the astro view's bottom border.
+/// **Splitting (`grid_amount` opening).** The astro sliver travels up to the
+/// astro rect's top border. Over the first [`SLIVER_SPLIT_PX`] of separation
+/// each piece morphs from *the master spear clipped to its own extent* into its
+/// own standalone spear — the astro sliver to a lone 6px spear tipping at its
+/// mid-line, the lower assembly to a 9px spear still tipping at the cut. At
+/// separation 0 both pieces evaluate to exactly the master, so the fused spear
+/// *becomes* two spears with no pop; a piece drawn as its own spear from the
+/// start would snap back to body width at its cut edge. The dock sliver stays
+/// put as the astro view's bottom border.
 struct SliverStack {
-    dock_top: f64,
-    dock_bot: f64,
+    /// Top edge of the astro sliver — the backdrop is pulled out behind it, so
+    /// `draw_astro_overlay` keys the panel's top edge off this. Every other
+    /// edge lives on the pieces: `astro.clip_*` are the astro sliver's own
+    /// extent and `lower.clip_top` is the dock sliver's top (its bottom edge,
+    /// `+ default_height_px`, is the astro view's bottom border).
     astro_top: f64,
-    astro_bot: f64,
-    /// Shared by both halves — they are one shape until they separate.
+    /// Bottom of the **lower assembly**: the dock sliver *plus* the main bar's
+    /// lifted top half, drawn as one shape. They are permanently adjacent — the
+    /// top half rides the same lift the dock sliver does.
+    lower_bot: f64,
+    /// True while the astro sliver still rests on the lower assembly, when the
+    /// whole stack draws as one path — see [`SliverStack::assembly`].
+    fused: bool,
+    astro: SliverPiece,
+    lower: SliverPiece,
+}
+
+/// One drawn piece: the spear to fill, and the slab of it to keep. While the
+/// pieces are separating, `spear` is wider than `clip` — each piece is showing
+/// its share of a taller shape, which is what makes the split continuous.
+#[derive(Clone, Copy)]
+struct SliverPiece {
+    top: f64,
+    bot: f64,
     tip_len: f64,
-    dock_tip_y: f64,
-    astro_tip_y: f64,
+    tip_y: f64,
+    clip_top: f64,
+    clip_bot: f64,
+}
+
+impl SliverStack {
+    /// The fused resting silhouette as a single spear, or `None` once the astro
+    /// sliver has left and the two pieces draw themselves.
+    fn assembly(&self) -> Option<SliverPiece> {
+        self.fused.then_some(SliverPiece {
+            top: self.astro_top,
+            bot: self.lower_bot,
+            tip_len: tip_len_for(self.lower_bot - self.astro_top),
+            tip_y: self.lower_bot,
+            clip_top: self.astro_top,
+            clip_bot: self.lower_bot,
+        })
+    }
+}
+
+/// Fill `piece`'s spear, clipped to the slab it owns.
+fn fill_sliver(ctx: &CairoContext, x: f64, w: f64, piece: &SliverPiece, slope: f64) {
+    ctx.save().ok();
+    ctx.rectangle(x, piece.clip_top, w, (piece.clip_bot - piece.clip_top).max(0.0));
+    ctx.clip();
+    spear_path(ctx, x, w, piece.top, piece.bot, piece.tip_len, piece.tip_y, slope);
+    let _ = ctx.fill();
+    ctx.restore().ok();
+}
+
+/// A spear's tip length is [`SPEAR_TIP_RATIO`]x its height — the one rule the
+/// whole silhouette keys off, so a fused stack tapers at the same angle as any
+/// single piece of it.
+fn tip_len_for(height: f64) -> f64 {
+    height * SPEAR_TIP_RATIO
 }
 
 fn sliver_stack(surface_w: f64, surface_h: f64, g: &Geometry, v: &Visual) -> SliverStack {
@@ -466,24 +503,40 @@ fn sliver_stack(surface_w: f64, surface_h: f64, g: &Geometry, v: &Visual) -> Sli
     let dock_bot = bar_bot - bar_h - lift;
     let dock_top = dock_bot - bar_h;
     let fused_top = dock_top - bar_h;
+    // The bar's top half ends at the section cut line, which rides the lift.
+    let lower_bot = dock_bot + bar_h / 2.0;
 
     // Travel: the astro sliver's top edge runs from the fused position to the
     // astro rect's top border, so at full open it *is* the top border (and the
-    // backdrop's top edge follows it — see `draw_app_grid_overlay`).
+    // backdrop's top edge follows it — see `draw_astro_overlay`).
     let astro_top = lerp(fused_top, astro_rect(surface_w, surface_h, g).top, v.grid_amount);
     let astro_bot = astro_top + bar_h;
 
     let split = ((dock_top - astro_bot) / SLIVER_SPLIT_PX).clamp(0.0, 1.0);
-    let tip_len = lerp(2.0 * bar_h * SPEAR_TIP_RATIO, bar_h * SPEAR_TIP_RATIO, split);
+    let fused_tip = tip_len_for(lower_bot - fused_top);
 
     SliverStack {
-        dock_top,
-        dock_bot,
         astro_top,
-        astro_bot,
-        tip_len,
-        dock_tip_y: lerp(dock_top, dock_top + bar_h / 2.0, split),
-        astro_tip_y: lerp(astro_bot, astro_bot - bar_h / 2.0, split),
+        lower_bot,
+        fused: split <= 0.0,
+        // Each piece starts as the master spear (bottom + tip at the cut,
+        // fused tip length) and relaxes into its own.
+        astro: SliverPiece {
+            top: astro_top,
+            bot: lerp(lower_bot, astro_bot, split),
+            tip_len: lerp(fused_tip, tip_len_for(bar_h), split),
+            tip_y: lerp(lower_bot, astro_bot - bar_h / 2.0, split),
+            clip_top: astro_top,
+            clip_bot: astro_bot,
+        },
+        lower: SliverPiece {
+            top: lerp(astro_top, dock_top, split),
+            bot: lower_bot,
+            tip_len: lerp(fused_tip, tip_len_for(lower_bot - dock_top), split),
+            tip_y: lower_bot,
+            clip_top: dock_top,
+            clip_bot: lower_bot,
+        },
     }
 }
 
@@ -1731,41 +1784,6 @@ fn bottom_half_path(
     ctx.close_path();
 }
 
-/// Top trapezoid half. Long edge at `cut_y`, short edge at `top_y`.
-fn top_half_path(
-    ctx: &CairoContext,
-    x: f64,
-    w: f64,
-    bar_h: f64,
-    top_y: f64,
-    cut_y: f64,
-    slope: f64,
-) {
-    let (left_tip, left_inner, right_inner, right_tip, off_x, off_y) =
-        spear_geom(x, w, bar_h, slope);
-
-    ctx.move_to(left_inner, top_y);
-    ctx.line_to(right_inner, top_y);
-    ctx.curve_to(
-        right_inner + off_x,
-        top_y,
-        right_tip,
-        cut_y - off_y,
-        right_tip,
-        cut_y,
-    );
-    ctx.line_to(left_tip, cut_y);
-    ctx.curve_to(
-        left_tip,
-        cut_y - off_y,
-        left_inner - off_x,
-        top_y,
-        left_inner,
-        top_y,
-    );
-    ctx.close_path();
-}
-
 /// Tip length per unit of spear height — the "6×" ratio the whole silhouette
 /// keys off. A fused 12px sliver pair therefore tips at 72px, a lone 6px
 /// sliver at 36px (which is also the astro rect's side indent).
@@ -2268,48 +2286,72 @@ mod tests {
     #[test]
     fn sliver_stack_fused_when_astro_closed() {
         let g = Geometry::default();
+        let bar_h = g.default_height_px as f64;
         for detailed in [0.0, 1.0] {
             let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(detailed, 0.0));
-            // Halves are adjacent — no gap to reveal the backdrop through.
-            assert!((s.astro_bot - s.dock_top).abs() < 1e-9, "detailed={detailed}");
-            // Both tip on the shared edge with the combined-height tip length,
-            // so the union is exactly one 12px spear (note 010 §Frame spec).
-            assert!((s.tip_len - 2.0 * g.default_height_px as f64 * SPEAR_TIP_RATIO).abs() < 1e-9);
-            assert!((s.astro_tip_y - s.astro_bot).abs() < 1e-9);
-            assert!((s.dock_tip_y - s.dock_top).abs() < 1e-9);
-            // Stack is exactly two slivers tall.
-            assert!((s.dock_bot - s.astro_top - 2.0 * g.default_height_px as f64).abs() < 1e-9);
+            assert!(s.fused, "detailed={detailed}");
+            // Astro sliver, dock sliver and the bar's top half are adjacent —
+            // no gap to reveal the backdrop through.
+            assert!((s.astro.clip_bot - s.lower.clip_top).abs() < 1e-9, "detailed={detailed}");
+            assert!((s.lower_bot - s.lower.clip_top - 1.5 * bar_h).abs() < 1e-9);
+            // One shape: `assembly` spans all three, 2.5 slivers tall, and its
+            // tip length is that whole height at the 6x ratio.
+            let a = s.assembly().unwrap();
+            assert!((a.top - s.astro_top).abs() < 1e-9);
+            assert!((a.bot - s.lower_bot).abs() < 1e-9);
+            assert!((a.bot - a.top - 2.5 * bar_h).abs() < 1e-9);
+            assert!((a.tip_len - 2.5 * bar_h * SPEAR_TIP_RATIO).abs() < 1e-9);
+            assert!((a.tip_y - a.bot).abs() < 1e-9, "tip must sit on the cut line");
+            // Both pieces evaluate to that same master spear while fused, so
+            // nothing pops the instant the astro sliver lifts off.
+            for piece in [s.astro, s.lower] {
+                assert!((piece.top - a.top).abs() < 1e-9);
+                assert!((piece.bot - a.bot).abs() < 1e-9);
+                assert!((piece.tip_len - a.tip_len).abs() < 1e-9);
+                assert!((piece.tip_y - a.tip_y).abs() < 1e-9);
+            }
+            // ...and their clips tile the master exactly, no gap, no overlap.
+            assert!((s.astro.clip_top - a.top).abs() < 1e-9);
+            assert!((s.astro.clip_bot - s.lower.clip_top).abs() < 1e-9);
+            assert!((s.lower.clip_bot - a.bot).abs() < 1e-9);
         }
     }
 
     #[test]
     fn sliver_stack_fused_rides_the_detailed_lift() {
         let g = Geometry::default();
+        let bar_h = g.default_height_px as f64;
         let closed = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(0.0, 0.0));
         let detailed = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(1.0, 0.0));
         let lift = g.detailed_content_height_px as f64;
-        assert!((closed.dock_bot - detailed.dock_bot - lift).abs() < 1e-9);
+        assert!((closed.lower.clip_top - detailed.lower.clip_top - lift).abs() < 1e-9);
         // Detailed: the dock sliver's bottom edge is the astro rect's bottom
         // border — one line, per the amended frame spec.
         let rect = astro_rect(SURFACE_W, SURFACE_H, &g);
-        assert!((detailed.dock_bot - rect.bottom).abs() < 1e-9);
+        assert!((detailed.lower.clip_top + bar_h - rect.bottom).abs() < 1e-9);
     }
 
     #[test]
     fn sliver_stack_open_puts_astro_on_the_top_border() {
         let g = Geometry::default();
+        let bar_h = g.default_height_px as f64;
         let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(1.0, 1.0));
         let rect = astro_rect(SURFACE_W, SURFACE_H, &g);
         // Astro sliver = top border; dock sliver stayed as the bottom border.
+        assert!(!s.fused);
+        assert!(s.assembly().is_none());
         assert!((s.astro_top - rect.top).abs() < 1e-9);
-        assert!((s.dock_bot - rect.bottom).abs() < 1e-9);
-        // Fully split: each half owns a lone sliver's tip, centred.
-        assert!((s.tip_len - g.default_height_px as f64 * SPEAR_TIP_RATIO).abs() < 1e-9);
-        assert!((s.astro_tip_y - (s.astro_top + s.astro_bot) / 2.0).abs() < 1e-9);
-        assert!((s.dock_tip_y - (s.dock_top + s.dock_bot) / 2.0).abs() < 1e-9);
+        assert!((s.lower.clip_top + bar_h - rect.bottom).abs() < 1e-9);
+        // Fully split: the astro sliver owns a lone sliver's tip, centred; the
+        // lower assembly keeps ONE tip for its 1.5 slivers of height.
+        assert!((s.astro.tip_len - bar_h * SPEAR_TIP_RATIO).abs() < 1e-9);
+        assert!((s.astro.tip_y - (s.astro_top + s.astro.clip_bot) / 2.0).abs() < 1e-9);
+        assert!((s.astro.bot - s.astro.clip_bot).abs() < 1e-9, "piece must be its own height");
+        assert!((s.lower.tip_len - 1.5 * bar_h * SPEAR_TIP_RATIO).abs() < 1e-9);
+        assert!((s.lower.top - s.lower.clip_top).abs() < 1e-9);
         // The open sliver's tips reach exactly the rect's side indent.
         let bar_left = (SURFACE_W - (g.width_px as f64).min(SURFACE_W)) / 2.0;
-        assert!((bar_left + s.tip_len - rect.x).abs() < 1e-9);
+        assert!((bar_left + s.astro.tip_len - rect.x).abs() < 1e-9);
     }
 
     #[test]
@@ -2321,58 +2363,56 @@ mod tests {
             let t = i as f64 / 20.0;
             let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(1.0, t));
             assert!(s.astro_top < prev_top, "astro sliver must keep travelling up at t={t}");
-            assert!(s.tip_len <= prev_tip + 1e-9, "tip length must not grow back at t={t}");
-            assert!(s.astro_bot <= s.dock_top + 1e-9, "halves must never overlap at t={t}");
+            assert!(s.astro.tip_len <= prev_tip + 1e-9, "tip length must not grow back at t={t}");
+            assert!(s.astro.clip_bot <= s.lower.clip_top + 1e-9, "halves must never overlap at t={t}");
             prev_top = s.astro_top;
-            prev_tip = s.tip_len;
+            prev_tip = s.astro.tip_len;
         }
         // The tip morph completes inside the first `SLIVER_SPLIT_PX` of travel.
         let travel = SURFACE_H - g.margin_bottom_px as f64
             - g.default_height_px as f64 * 3.0
             - g.detailed_content_height_px as f64;
         let s = sliver_stack(SURFACE_W, SURFACE_H, &g, &visual(1.0, SLIVER_SPLIT_PX / travel));
-        assert!((s.tip_len - g.default_height_px as f64 * SPEAR_TIP_RATIO).abs() < 1e-6);
+        assert!((s.astro.tip_len - g.default_height_px as f64 * SPEAR_TIP_RATIO).abs() < 1e-6);
     }
 
-    /// The fusion claim, checked in pixels: two fused halves painted separately
-    /// cover exactly the same area as one spear of their combined height. A
-    /// regression here means the bowtie is back.
+    /// The whole point of the fused assembly, checked in pixels: above the
+    /// section cut the silhouette must widen **monotonically** downward — one
+    /// taper, not two. Stacking separately tipped spears produced a second tip
+    /// line 6px below the first (user report 2026-08-07); a regression here
+    /// means that is back.
     #[test]
-    fn fused_halves_paint_the_same_shape_as_one_tall_spear() {
+    fn the_resting_silhouette_has_exactly_one_taper() {
         let g = Geometry::default();
-        let (w, h) = (240.0, 40.0);
         let bar_h = g.default_height_px as f64;
-        let (top, mid, bot) = (10.0, 10.0 + bar_h, 10.0 + 2.0 * bar_h);
-        let tip = 2.0 * bar_h * SPEAR_TIP_RATIO;
+        let (w, h) = (240.0, 40.0);
+        let top = 6.0;
+        let bot = top + 2.5 * bar_h;
 
-        let render = |paint: &dyn Fn(&CairoContext)| -> Vec<u8> {
-            let mut surface =
-                cairo::ImageSurface::create(cairo::Format::A8, w as i32, h as i32).unwrap();
+        let mut surface =
+            cairo::ImageSurface::create(cairo::Format::A8, w as i32, h as i32).unwrap();
+        {
             let ctx = CairoContext::new(&surface).unwrap();
             ctx.set_source_rgba(0.0, 0.0, 0.0, 1.0);
-            paint(&ctx);
-            drop(ctx);
-            surface.data().unwrap().to_vec()
-        };
+            spear_path(&ctx, 0.0, w, top, bot, tip_len_for(bot - top), bot, g.taper_slope);
+            ctx.fill().unwrap();
+        }
+        let stride = surface.stride() as usize;
+        let data = surface.data().unwrap();
+        let width_at = |y: usize| (0..w as usize).filter(|x| data[y * stride + x] > 128).count();
 
-        let fused = render(&|ctx: &CairoContext| {
-            spear_path(ctx, 0.0, w, top, bot, tip, mid, g.taper_slope);
-            ctx.fill().unwrap();
-        });
-        let halves = render(&|ctx: &CairoContext| {
-            spear_path(ctx, 0.0, w, top, mid, tip, mid, g.taper_slope);
-            ctx.fill().unwrap();
-            spear_path(ctx, 0.0, w, mid, bot, tip, mid, g.taper_slope);
-            ctx.fill().unwrap();
-        });
-        assert_eq!(fused.len(), halves.len());
-        let differing = fused
-            .iter()
-            .zip(&halves)
-            .filter(|(a, b)| a.abs_diff(**b) > 8)
-            .count();
-        // Only antialias seams along the shared edge may differ.
-        assert!(differing < 16, "fused pair diverges from one spear in {differing} px");
+        let mut prev = 0;
+        for y in (top.ceil() as usize)..(bot.floor() as usize) {
+            let wide = width_at(y);
+            assert!(
+                wide >= prev,
+                "row {y} narrows to {wide} after {prev} — a second taper is back"
+            );
+            prev = wide;
+        }
+        // And it really does reach full width at the cut, so the sections
+        // extruding from that line stay capped at their corners.
+        assert_eq!(width_at(bot.floor() as usize - 1), w as usize);
     }
 
     #[test]
@@ -2436,18 +2476,36 @@ mod tests {
     /// (`grim` / `wf-recorder` both fail on eDP-1), so this is how the shape
     /// gets reviewed without a screenshot. Run:
     /// `cargo test dump_astro_frames -- --ignored --nocapture`
+    ///
+    /// `SLIVER_FRAME_GRID=0,0.002,0.01` adds a frame per `grid_amount`, which
+    /// is how the sliver split is checked for continuity across the moment of
+    /// separation (measure the tip's x-extent outside the backdrop's
+    /// `astro_rect` x-range — inside it, the black backdrop reads as sliver).
     #[test]
     #[ignore = "writes PNGs for human review"]
     fn dump_astro_frames() {
         let g = Geometry::default();
         let dir = std::env::var("SLIVER_FRAME_DIR").unwrap_or_else(|_| "/tmp".into());
+        let extra: Vec<(String, Visual)> = std::env::var("SLIVER_FRAME_GRID")
+            .ok()
+            .into_iter()
+            .flat_map(|spec| {
+                spec.split(',')
+                    .filter_map(|t| t.trim().parse::<f64>().ok())
+                    .map(|t| (format!("grid-{t}"), visual(1.0, t)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         for (name, v) in [
-            ("fused-closed", visual(0.0, 0.0)),
-            ("fused-detailed", visual(1.0, 0.0)),
-            ("split-early", visual(1.0, 0.06)),
-            ("travelling", visual(1.0, 0.5)),
-            ("open", visual(1.0, 1.0)),
-        ] {
+            ("fused-closed".to_string(), visual(0.0, 0.0)),
+            ("fused-detailed".to_string(), visual(1.0, 0.0)),
+            ("split-early".to_string(), visual(1.0, 0.06)),
+            ("travelling".to_string(), visual(1.0, 0.5)),
+            ("open".to_string(), visual(1.0, 1.0)),
+        ]
+        .into_iter()
+        .chain(extra)
+        {
             let mut surface = cairo::ImageSurface::create(
                 cairo::Format::Rgb24,
                 SURFACE_W as i32,
@@ -2486,29 +2544,14 @@ mod tests {
                 // live draw, so the junctions read the same.
                 let bar_bot = SURFACE_H - g.margin_bottom_px as f64;
                 let cut_y = bar_bot - bar_h / 2.0;
-                let lift = v.detailed_amount * g.detailed_content_height_px as f64;
                 bottom_half_path(&ctx, bar_left, bar_w, bar_h, cut_y, bar_bot, g.taper_slope);
                 ctx.fill().unwrap();
-                top_half_path(
-                    &ctx,
-                    bar_left,
-                    bar_w,
-                    bar_h,
-                    s.dock_bot,
-                    cut_y - lift,
-                    g.taper_slope,
-                );
-                ctx.fill().unwrap();
-                spear_path(
-                    &ctx, bar_left, bar_w, s.dock_top, s.dock_bot, s.tip_len, s.dock_tip_y,
-                    g.taper_slope,
-                );
-                ctx.fill().unwrap();
-                spear_path(
-                    &ctx, bar_left, bar_w, s.astro_top, s.astro_bot, s.tip_len, s.astro_tip_y,
-                    g.taper_slope,
-                );
-                ctx.fill().unwrap();
+                // Mirrors `draw_bar`: one fused spear while the astro sliver
+                // rests, the two clipped pieces once it has left.
+                fill_sliver(&ctx, bar_left, bar_w, &s.assembly().unwrap_or(s.lower), g.taper_slope);
+                if !s.fused {
+                    fill_sliver(&ctx, bar_left, bar_w, &s.astro, g.taper_slope);
+                }
             }
             // Rgb24 is 32-bit native-endian xRGB — little-endian byte order
             // B,G,R,x — with a padded stride.
@@ -2538,3 +2581,4 @@ mod tests {
         }
     }
 }
+
