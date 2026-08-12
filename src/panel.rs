@@ -113,6 +113,18 @@ fn on_activate(app: &Application) {
         drag_for_map.refresh_input_region();
     });
 
+    // The input region is measured up from the surface's bottom edge, so it is
+    // only valid for the surface height it was computed against. The astro
+    // surface is `screen_h - D` tall — an unconstrained one swallows every
+    // touch on the desktop below — and its real height arrives with the
+    // compositor's configure, after this function returns. Re-derive on every
+    // allocation change, the same real-height-is-the-source-of-truth rule the
+    // draw path follows.
+    let drag_for_resize = Rc::clone(&drag);
+    area.connect_resize(move |_, _, _| {
+        drag_for_resize.refresh_input_region();
+    });
+
     watch_monitor_changes(Rc::clone(&drag), geom);
     spawn_clock_tick(&area);
     battery::spawn(Rc::clone(&drag));
@@ -129,6 +141,9 @@ fn on_activate(app: &Application) {
             apply_command(&mut req, &drag, &app_quit);
         }
     });
+
+    // Last, so the map / resize handlers above are live for the first map.
+    window.present();
 }
 
 /// Spawn the wayfire subscriber thread + a GTK-side consumer that pipes
@@ -307,7 +322,11 @@ fn build_window(app: &Application, cfg: &config::Config) -> (ApplicationWindow, 
     area.set_vexpand(true);
     window.set_child(Some(&area));
 
-    window.present();
+    // Deliberately NOT presented here. `present()` realizes and maps the
+    // window synchronously, so any handler connected after it — `map`,
+    // `resize` — misses the first one. `on_activate` presents once everything
+    // is wired; the input region depends on that map/resize pair firing
+    // (`incident-20260811-astro-surface-swallows-touch`).
     (window, area)
 }
 
