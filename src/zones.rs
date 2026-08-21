@@ -42,6 +42,7 @@ fn send_or_log(line: &str, op: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn register(
     id: &str,
     x: i32,
@@ -80,6 +81,7 @@ pub fn register(
 /// `travel_px` overrides touch-drawer's default progress denominator
 /// (`screen_height / 3`). Pass the zone's own height for thin overlays so
 /// a swipe across the available pixels reaches progress 1.0.
+#[allow(clippy::too_many_arguments)]
 pub fn register_bidir(
     id: &str,
     x: i32,

@@ -1016,14 +1016,13 @@ impl Drag {
                 .get(&ws)
                 .copied()
                 .unwrap_or(BarState::Detailed);
-            if let Some(restore) = saved {
-                if current == BarState::Hidden {
+            if let Some(restore) = saved
+                && current == BarState::Hidden {
                     self.workspaces.borrow_mut().insert(ws, restore);
                     if ws == current_ws {
                         self.snap_to_state(restore);
                     }
                 }
-            }
         }
 
         *self.fullscreen_workspaces.borrow_mut() = new_set;

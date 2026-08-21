@@ -158,8 +158,7 @@ pub fn set_workspace(ws: WorkspaceId, output_id: i64) -> std::io::Result<()> {
     if resp.get("result").and_then(|v| v.as_str()) == Some("ok") {
         Ok(())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             format!("set-workspace failed: {resp}"),
         ))
     }
@@ -181,8 +180,7 @@ pub fn configure_view(view_id: i64, x: i32, y: i32, w: i32, h: i32) -> std::io::
     if resp.get("result").and_then(|v| v.as_str()) == Some("ok") {
         Ok(())
     } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        Err(std::io::Error::other(
             format!("configure-view failed: {resp}"),
         ))
     }
@@ -199,17 +197,17 @@ fn fetch_output_state() -> std::io::Result<OutputState> {
     let resp = one_shot_call("window-rules/get-focused-output", None)?;
     let info = resp
         .get("info")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no info in response"))?;
+        .ok_or_else(|| std::io::Error::other("no info in response"))?;
     let ws = info
         .get("workspace")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no workspace field"))?;
+        .ok_or_else(|| std::io::Error::other("no workspace field"))?;
     let id = info
         .get("id")
         .and_then(|v| v.as_i64())
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no output id"))?;
+        .ok_or_else(|| std::io::Error::other("no output id"))?;
     let geom = info
         .get("geometry")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no geometry field"))?;
+        .ok_or_else(|| std::io::Error::other("no geometry field"))?;
     let workspace = WorkspaceId {
         x: ws.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
         y: ws.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
@@ -234,8 +232,7 @@ fn fetch_view_list() -> std::io::Result<Vec<Value>> {
     let resp = one_shot_call("window-rules/list-views", None)?;
     match resp {
         Value::Array(a) => Ok(a),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        _ => Err(std::io::Error::other(
             "list-views: expected array",
         )),
     }
@@ -350,8 +347,7 @@ fn subscribe_once(tx: &async_channel::Sender<Event>) -> std::io::Result<()> {
     write_frame(&mut stream, &json!({ "method": "window-rules/events/watch" }))?;
     let ack = read_frame(&mut stream)?;
     if ack.get("result").and_then(|v| v.as_str()) != Some("ok") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             format!("subscribe ack: {ack}"),
         ));
     }

@@ -145,11 +145,10 @@ fn parse_entry(id: &str, body: &str) -> Option<AppEntry> {
         }
     }
 
-    if let Some(t) = &entry_type {
-        if t != "Application" {
+    if let Some(t) = &entry_type
+        && t != "Application" {
             return None;
         }
-    }
 
     Some(AppEntry {
         id: id.to_owned(),
@@ -222,6 +221,7 @@ pub fn strip_exec_field_codes(exec: &str) -> String {
 ///   * `~/...` — `$HOME` expansion.
 ///   * bare name (`firefox`) — looked up via the system icon theme at
 ///     `size`, returning whatever the theme picks (PNG variant or SVG).
+///
 /// `None` if the theme has no match and the spec isn't a real path.
 pub fn resolve_icon_path(spec: &str, size: i32) -> Option<PathBuf> {
     if spec.starts_with('/') {
@@ -314,7 +314,7 @@ pub fn build_visible(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) -> 
         .cloned()
         .map(apply_override)
         .collect();
-    rest.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    rest.sort_by_key(|a| a.name.to_lowercase());
     out.extend(rest);
     out
 }

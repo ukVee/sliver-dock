@@ -194,13 +194,11 @@ fn spawn_wayfire_subscriber(drag: &Rc<Drag>) {
                     drag.set_workspace_app_montages(map);
                 }
                 wayfire::Event::ViewMapped { id, app_id } => {
-                    if app_id == terminal_app_id(drag.terminal()) {
-                        if let Some((x, y, w, h)) = drag.pop_terminal_slot() {
-                            if let Err(e) = wayfire::configure_view(id, x, y, w, h) {
+                    if app_id == terminal_app_id(drag.terminal())
+                        && let Some((x, y, w, h)) = drag.pop_terminal_slot()
+                            && let Err(e) = wayfire::configure_view(id, x, y, w, h) {
                                 eprintln!("sliver-dock: configure-view({id}): {e}");
                             }
-                        }
-                    }
                 }
                 wayfire::Event::Disconnected => {
                     eprintln!("sliver-dock: wayfire disconnected; reconnecting");
@@ -679,6 +677,7 @@ fn sky_rect(rect: &AstroRect) -> astro::SkyRect {
 /// Tokyo Night palette: section bg uses `bg_highlight` (#292e42). Live
 /// content (workspaces / apps / info) renders over the bg, gated by the
 /// same per-section clip so the reveal stays in lockstep with extrusion.
+#[allow(clippy::too_many_arguments)]
 fn draw_sections(
     ctx: &CairoContext,
     bar_left: f64,
@@ -1154,7 +1153,7 @@ fn weekday_abbrev(w: time::Weekday) -> &'static str {
 /// sound wrong out loud. Otherwise it's the trailing digit.
 fn ordinal_suffix(day: u8) -> &'static str {
     match day {
-        11 | 12 | 13 => "th",
+        11..=13 => "th",
         n => match n % 10 {
             1 => "st",
             2 => "nd",
@@ -1609,16 +1608,14 @@ fn handle_app_tap(drag: &Rc<Drag>, entry: &AppEntry) {
 
     if let (Some(grid), Some(output_id)) = (drag.grid(), drag.wayfire_output_id()) {
         let opened = drag.opened_workspaces();
-        if let Some(target) = first_free_workspace(grid, &opened) {
-            if target != drag.current_workspace() {
-                if let Err(e) = wayfire::set_workspace(target, output_id) {
+        if let Some(target) = first_free_workspace(grid, &opened)
+            && target != drag.current_workspace()
+                && let Err(e) = wayfire::set_workspace(target, output_id) {
                     eprintln!(
                         "sliver-dock: set-workspace({},{}): {e}",
                         target.x, target.y
                     );
                 }
-            }
-        }
     }
 
     let cmdline = apps::strip_exec_field_codes(exec);
@@ -1656,8 +1653,8 @@ fn handle_terminal_tap(drag: &Rc<Drag>) {
     let Some(output_id) = drag.wayfire_output_id() else { return };
     let term_id = terminal_app_id(drag.terminal());
 
-    if let Some(saved) = drag.terminal_workspace() {
-        if drag.running_apps().contains(term_id) {
+    if let Some(saved) = drag.terminal_workspace()
+        && drag.running_apps().contains(term_id) {
             if let Err(e) = wayfire::set_workspace(saved, output_id) {
                 eprintln!(
                     "sliver-dock: terminal re-focus set-workspace({},{}): {e}",
@@ -1666,7 +1663,6 @@ fn handle_terminal_tap(drag: &Rc<Drag>) {
             }
             return;
         }
-    }
 
     let Some(grid) = drag.grid() else { return };
     let opened = drag.opened_workspaces();
@@ -1680,14 +1676,13 @@ fn handle_terminal_tap(drag: &Rc<Drag>) {
     drag.enqueue_terminal_slots(terminal_layout_slots(count, output_size));
     drag.set_terminal_workspace(Some(target));
 
-    if target != drag.current_workspace() {
-        if let Err(e) = wayfire::set_workspace(target, output_id) {
+    if target != drag.current_workspace()
+        && let Err(e) = wayfire::set_workspace(target, output_id) {
             eprintln!(
                 "sliver-dock: terminal set-workspace({},{}): {e}",
                 target.x, target.y
             );
         }
-    }
 
     let cmdline = drag.terminal().command.clone();
     let mut any_spawn = false;
@@ -1872,8 +1867,8 @@ fn load_css() {
     // sliver-dock/style.css (source: dotfiles/src/sliver-dock/style.css).
     // ENOENT-tolerant — popovers and friends fall back to default GTK
     // theme without it.
-    if let Some(path) = user_css_path() {
-        if path.is_file() {
+    if let Some(path) = user_css_path()
+        && path.is_file() {
             let provider = CssProvider::new();
             provider.load_from_path(&path);
             gtk4::style_context_add_provider_for_display(
@@ -1882,7 +1877,6 @@ fn load_css() {
                 gtk4::STYLE_PROVIDER_PRIORITY_USER,
             );
         }
-    }
 }
 
 fn user_css_path() -> Option<std::path::PathBuf> {
