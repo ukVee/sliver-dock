@@ -86,6 +86,15 @@ pub struct Visual {
     pub grid_amount: f64,
 }
 
+/// Whether the workspaces section has any height on screen. It is the
+/// first detailed-view section and `panel::draw_detailed_sections` gives
+/// every section a height of `detailed_amount × max_h`, so the section is
+/// off screen exactly when that factor is zero — false in `Closed` and
+/// `Hidden`, true from the first frame of an opening drag.
+pub fn workspaces_section_visible(v: Visual) -> bool {
+    v.detailed_amount > 0.0
+}
+
 impl From<BarState> for Visual {
     fn from(s: BarState) -> Self {
         match s {
@@ -602,8 +611,16 @@ impl Drag {
 
     /// Replace the per-workspace view-record map. `queue_draw` only fires
     /// when the projection actually changes — the subscriber already gates
-    /// the event, but a manual equality check keeps `set_workspace_views`
-    /// safe to call from anywhere without forcing a redraw.
+    /// the event (in icon space, slice 007), but a manual equality check
+    /// keeps `set_workspace_views` safe to call from anywhere without
+    /// forcing a redraw.
+    ///
+    /// Low-power (slice 007): the data is always kept current, but the
+    /// redraw is gated on the workspaces section being on screen at all.
+    /// The dock is `Closed` almost all the time and window churn never
+    /// stops, so a redraw per retile of an invisible section is pure waste;
+    /// opening the dock repaints from the stored map, so it can never show
+    /// a stale miniature.
     pub fn set_workspace_views(&self, map: HashMap<WorkspaceId, Vec<MontageView>>) {
         let mut slot = self.workspace_views.borrow_mut();
         if *slot == map {
@@ -611,7 +628,9 @@ impl Drag {
         }
         *slot = map;
         drop(slot);
-        self.area.queue_draw();
+        if workspaces_section_visible(self.visual()) {
+            self.area.queue_draw();
+        }
     }
 
     /// Ordered toplevel-view records for `ws` — one per open window,
@@ -1461,6 +1480,23 @@ fn direction_str(d: Direction) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slice 007 low-power: a montage update redraws only when the section
+    /// it lives in is actually on screen. The data is stored either way, so
+    /// opening the dock always paints the current arrangement.
+    #[test]
+    fn montage_redraw_is_gated_on_the_section_being_on_screen() {
+        assert!(!workspaces_section_visible(Visual::from(BarState::Closed)));
+        assert!(!workspaces_section_visible(Visual::from(BarState::Hidden)));
+        assert!(workspaces_section_visible(Visual::from(BarState::Detailed)));
+        assert!(workspaces_section_visible(Visual::from(BarState::AppGrid)));
+        // Mid-drag: visible from the first frame that has any height.
+        assert!(workspaces_section_visible(Visual {
+            hidden_amount: 0.0,
+            detailed_amount: 0.01,
+            grid_amount: 0.0,
+        }));
+    }
 
     #[test]
     fn forward_progress_down_unchanged() {

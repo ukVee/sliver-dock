@@ -2437,6 +2437,16 @@ mod tests {
         ViewRect { x, y, w, h }
     }
 
+    /// Slice 007's change gate quantises geometry to
+    /// `wayfire::MONTAGE_QUANT_STEPS` before deciding whether the montage
+    /// changed. That number is only correct while it matches the icon the
+    /// montage is drawn into — if `ICON_SIZE` grows, the gate would start
+    /// swallowing changes the renderer can now resolve.
+    #[test]
+    fn montage_quantisation_matches_the_icon_it_is_drawn_into() {
+        assert_eq!(ICON_SIZE as i32, crate::wayfire::MONTAGE_QUANT_STEPS);
+    }
+
     #[test]
     fn content_box_landscape_letterboxes_vertically() {
         // 1280×853 ≈ 1.5:1 inside the 41×41 icon → ~41×27.3 centred
