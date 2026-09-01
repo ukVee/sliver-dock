@@ -113,12 +113,48 @@ impl From<BarState> for Visual {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Session {
     source: BarState,
     target: BarState,
     direction: Direction,
+    /// The touch-drawer zone id that matched, from the optional `zone=`
+    /// token on `drag-begin`. `None` when the running plugin predates the
+    /// token (slice 003 protocol extension) — the gesture still works, only
+    /// the sample ring can't name the zone.
+    zone: Option<String>,
 }
+
+/// One completed gesture, captured at `drag-end` — the per-gesture sample
+/// the fling-threshold tune (slice 003) needs. Kept in a bounded in-memory
+/// ring surfaced through `get-state`, so the human collects real flicks
+/// with `nc` instead of grep'ing the journal. No per-event cost: one push
+/// per released gesture, no timers, no disk writes.
+#[derive(Clone, Debug)]
+pub struct GestureSample {
+    /// Zone id that matched, or "-" when unknown (pre-token plugin).
+    pub zone: String,
+    pub direction: Direction,
+    /// State the gesture began in — with `direction` this pins the
+    /// routing arm, which disambiguates zone pairs sharing an arm.
+    pub source: BarState,
+    /// Forward-normalized progress at release — the tier's input.
+    pub progress: f64,
+    /// Raw release velocity, px/ms, positive = down — the fling tier's
+    /// input (`|v|` vs `fling_threshold_px_per_ms`).
+    pub velocity: f64,
+    /// Monotonic ms since daemon start, to correlate with the plugin's
+    /// own `drag-end` journal line.
+    pub ts_ms: u64,
+    /// The snap decision: committed to target (true) or bounced back to
+    /// the source (false). The diagnosis gold: which flicks bounced.
+    pub committed: bool,
+}
+
+/// Ring cap — 64 gestures is a full sampling session (the deferred
+/// verification asks for 10× per gesture, four gestures) with room to
+/// spare, at ~100 bytes an entry.
+const GESTURE_RING_CAP: usize = 64;
 
 pub struct Drag {
     geom: Geometry,
@@ -130,7 +166,7 @@ pub struct Drag {
     workspaces: RefCell<HashMap<WorkspaceId, BarState>>,
     current_ws: Cell<WorkspaceId>,
     visual: Cell<Visual>,
-    session: Cell<Option<Session>>,
+    session: RefCell<Option<Session>>,
     animation: RefCell<Option<glib::SourceId>>,
     /// Wayfire workspace grid (e.g. 2×2). Populated by the wayfire
     /// subscriber on Connected; `None` while the dock is in degraded mode.
@@ -251,6 +287,9 @@ pub struct Drag {
     /// the launcher is closed and a meteor doesn't fire at the same beat
     /// after every swipe-up.
     created_at: Instant,
+    /// Bounded ring of completed gestures ([`GestureSample`]) — the slice
+    /// 003 instrumentation, surfaced through `get-state`.
+    gesture_ring: RefCell<VecDeque<GestureSample>>,
 }
 
 impl Drag {
@@ -273,7 +312,7 @@ impl Drag {
             workspaces: RefCell::new(HashMap::new()),
             current_ws: Cell::new(WorkspaceId::ZERO),
             visual: Cell::new(BarState::Detailed.into()),
-            session: Cell::new(None),
+            session: RefCell::new(None),
             animation: RefCell::new(None),
             grid: Cell::new(None),
             wayfire_output_id: Cell::new(None),
@@ -302,6 +341,7 @@ impl Drag {
             astro_animation: RefCell::new(None),
             astro_was_animating: Cell::new(false),
             created_at: Instant::now(),
+            gesture_ring: RefCell::new(VecDeque::new()),
         })
     }
 
@@ -730,8 +770,27 @@ impl Drag {
                 )
             })
             .collect();
+        // Gesture sample ring (slice 003 instrumentation) — the fling-tune
+        // numbers, read back with `nc` after a sampling session.
+        let gestures: Vec<String> = self
+            .gesture_ring
+            .borrow()
+            .iter()
+            .map(|g| {
+                format!(
+                    r#"{{"zone":"{}","dir":"{}","source":"{}","p":{:.3},"v":{:.3},"ts_ms":{},"committed":{}}}"#,
+                    json_escape(&g.zone),
+                    direction_str(g.direction),
+                    g.source.as_str(),
+                    g.progress,
+                    g.velocity,
+                    g.ts_ms,
+                    g.committed,
+                )
+            })
+            .collect();
         format!(
-            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"planets":[{}],"sky":{}}}"#,
+            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"gestures":[{}],"planets":[{}],"sky":{}}}"#,
             self.state.get().as_str(),
             v.hidden_amount,
             v.detailed_amount,
@@ -741,6 +800,7 @@ impl Drag {
             ws.x,
             ws.y,
             entries.join(","),
+            gestures.join(","),
             planets.join(","),
             self.dump_sky(),
         )
@@ -896,7 +956,7 @@ impl Drag {
     /// visible — including transitions toward / away from Detailed — so
     /// clicks land while the gap is animating, not just after settle.
     fn input_should_be_expanded(&self) -> bool {
-        if let Some(s) = self.session.get() {
+        if let Some(s) = self.session.borrow().as_ref() {
             return matches!(s.source, BarState::Detailed | BarState::AppGrid)
                 || matches!(s.target, BarState::Detailed | BarState::AppGrid);
         }
@@ -904,7 +964,7 @@ impl Drag {
     }
 
     fn grid_expand_needed(&self) -> bool {
-        if let Some(s) = self.session.get() {
+        if let Some(s) = self.session.borrow().as_ref() {
             return matches!(s.source, BarState::AppGrid)
                 || matches!(s.target, BarState::AppGrid);
         }
@@ -914,7 +974,7 @@ impl Drag {
     #[allow(dead_code)] // Phase 3+: instant-set without animation
     pub fn jump_to(self: &Rc<Self>, target: BarState) {
         self.cancel_animation();
-        self.session.set(None);
+        *self.session.borrow_mut() = None;
         self.ensure_mapped();
         self.state.set(target);
         self.set_visual(target.into());
@@ -1032,7 +1092,7 @@ impl Drag {
         let from = self.visual.get();
         let to = Visual::from(target);
         self.cancel_animation();
-        self.session.set(None);
+        *self.session.borrow_mut() = None;
         self.ensure_mapped();
         if (from.hidden_amount - to.hidden_amount).abs() < 1e-6
             && (from.detailed_amount - to.detailed_amount).abs() < 1e-6
@@ -1064,27 +1124,35 @@ impl Drag {
         *self.animation.borrow_mut() = Some(id);
     }
 
-    pub fn begin(self: &Rc<Self>, direction: Direction) {
+    pub fn begin(self: &Rc<Self>, direction: Direction, zone: Option<String>) {
         let source = self.state.get();
         let Some(target) = begin_target(source, direction) else {
             return;
         };
         self.cancel_animation();
-        self.session.set(Some(Session {
+        *self.session.borrow_mut() = Some(Session {
             source,
             target,
             direction,
-        }));
+            zone,
+        });
         self.ensure_mapped();
         self.set_visual(Visual::from(source));
         self.refresh_input_region();
     }
 
     pub fn update(self: &Rc<Self>, progress: f64) {
-        let Some(s) = self.session.get() else { return };
-        let p = forward_progress(s.direction, progress);
-        let from = Visual::from(s.source);
-        let to = Visual::from(s.target);
+        let Some((direction, source, target)) = self
+            .session
+            .borrow()
+            .as_ref()
+            .map(|s| (s.direction, s.source, s.target))
+        else {
+            return;
+        };
+        let p = forward_progress(direction, progress);
+        let from = Visual::from(source);
+        let to = Visual::from(target);
         let v = Visual {
             hidden_amount: lerp(from.hidden_amount, to.hidden_amount, p),
             detailed_amount: lerp(from.detailed_amount, to.detailed_amount, p),
@@ -1094,28 +1162,69 @@ impl Drag {
     }
 
     pub fn end(self: &Rc<Self>, progress: f64, velocity_px_per_ms: f64) {
-        let Some(s) = self.session.get() else { return };
-        let p = forward_progress(s.direction, progress);
-        let v_forward = forward_velocity(s.direction, velocity_px_per_ms);
+        let (zone, direction, source, target) = match self.session.borrow().as_ref() {
+            Some(s) => (s.zone.clone(), s.direction, s.source, s.target),
+            None => return,
+        };
+        let p = forward_progress(direction, progress);
+        let v_forward = forward_velocity(direction, velocity_px_per_ms);
 
-        // Snap decision tier (cloned from swipe-panel/drag.rs:148):
-        //   1. fling — go with velocity sign
-        //   2. sub-fling motion — bias threshold toward direction of motion
-        //   3. stationary — neutral 0.5 midpoint
-        let target = if v_forward.abs() > self.anim.fling_threshold_px_per_ms {
-            if v_forward > 0.0 { s.target } else { s.source }
+        // Record the sample FIRST — it describes the gesture itself, not
+        // the state the snap is about to move us into. The zone defaults
+        // to "-" for pre-token plugins; the human's `buffering zone=`
+        // journal line still names it in that case.
+        let sample = GestureSample {
+            zone: zone.unwrap_or_else(|| "-".to_owned()),
+            direction,
+            source,
+            progress: p,
+            velocity: velocity_px_per_ms,
+            ts_ms: self.created_at.elapsed().as_millis() as u64,
+            committed: commits_to_target(p, v_forward, self.anim.fling_threshold_px_per_ms),
+        };
+        {
+            let mut ring = self.gesture_ring.borrow_mut();
+            if ring.len() >= GESTURE_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(sample);
+        }
+
+        let target = if commits_to_target(p, v_forward, self.anim.fling_threshold_px_per_ms) {
+            target
         } else {
-            const DIRECTION_BIAS: f64 = 0.05;
-            let snap_threshold = if v_forward > DIRECTION_BIAS {
-                0.2
-            } else if v_forward < -DIRECTION_BIAS {
-                0.8
-            } else {
-                0.5
-            };
-            if p > snap_threshold { s.target } else { s.source }
+            source
         };
         self.snap_to_state(target);
+    }
+}
+
+/// The snap-decision tier, extracted pure (slice 003) so the flick cases at
+/// low progress are unit-testable without a GTK window:
+///
+///   1. fling — `|v_forward| > fling_threshold_px_per_ms`: commit with the
+///      velocity sign. A quick flick commits regardless of how far the
+///      finger travelled; this tier is the zone-independent mechanism the
+///      "quick swipe" requirement (locked 2026-09-01) rides on.
+///   2. sub-fling motion — biased midpoint tier toward the direction of
+///      motion (±0.05 velocity bias).
+///   3. stationary — neutral 0.5 midpoint.
+///
+/// Returns `true` when the drag commits to the target, `false` when it
+/// bounces back to the source.
+fn commits_to_target(p: f64, v_forward: f64, fling_threshold_px_per_ms: f64) -> bool {
+    if v_forward.abs() > fling_threshold_px_per_ms {
+        v_forward > 0.0
+    } else {
+        const DIRECTION_BIAS: f64 = 0.05;
+        let snap_threshold = if v_forward > DIRECTION_BIAS {
+            0.2
+        } else if v_forward < -DIRECTION_BIAS {
+            0.8
+        } else {
+            0.5
+        };
+        p > snap_threshold
     }
 }
 
@@ -1276,6 +1385,16 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// The touch-drawer begin-arg spelling of a direction — the `dir=` field
+/// in the gesture ring matches the plugin's `drag-begin` line.
+fn direction_str(d: Direction) -> &'static str {
+    match d {
+        Direction::Up => "up",
+        Direction::Down => "down",
+        Direction::UpGrid => "up-grid",
+    }
 }
 
 #[cfg(test)]
@@ -1478,5 +1597,124 @@ mod tests {
         );
         assert_eq!(y, win_h - h);
         assert_eq!(x, (win_w - w) / 2);
+    }
+
+    // ---- slice 003: quick-flick decisiveness ---------------------------
+
+    const FLING: f64 = 0.6; // compiled default of fling_threshold_px_per_ms
+
+    #[test]
+    fn quick_flick_forward_commits_at_low_progress() {
+        // The locked requirement: a quick flick commits regardless of how
+        // far the finger travelled. v_forward above the fling threshold
+        // must win the tier even at p ≈ 0.1 (the tall detailed zone's
+        // progress at a 10px commit).
+        assert!(commits_to_target(0.1, 2.0, FLING));
+        assert!(commits_to_target(0.0, 2.0, FLING));
+    }
+
+    #[test]
+    fn quick_flick_backward_bounces_even_near_target() {
+        // Same velocity, wrong direction: the velocity sign decides, so a
+        // fast flick away from the target never commits.
+        assert!(!commits_to_target(0.95, -2.0, FLING));
+    }
+
+    #[test]
+    fn sub_fling_forward_bias_commits_from_low_p() {
+        // Slow-ish drag still moving toward the target: the ±0.05 bias
+        // drops the threshold to 0.2.
+        assert!(commits_to_target(0.21, 0.1, FLING));
+        assert!(!commits_to_target(0.19, 0.1, FLING));
+        // Bias boundary: exactly at the ±0.05 bias is NOT biased — the
+        // stationary 0.5 midpoint applies.
+        assert!(!commits_to_target(0.5, 0.05, FLING));
+        assert!(!commits_to_target(0.5, -0.05, FLING));
+        assert!(commits_to_target(0.51, 0.05, FLING));
+    }
+
+    #[test]
+    fn sub_fling_backward_bias_raises_threshold() {
+        // Slow drag moving away from the target must nearly arrive to
+        // commit — threshold raised to 0.8.
+        assert!(commits_to_target(0.81, -0.1, FLING));
+        assert!(!commits_to_target(0.79, -0.1, FLING));
+    }
+
+    #[test]
+    fn stationary_midpoint_is_neutral() {
+        assert!(commits_to_target(0.51, 0.0, FLING));
+        assert!(!commits_to_target(0.49, 0.0, FLING));
+    }
+
+    #[test]
+    fn fling_tier_is_strictly_above_threshold() {
+        // Exactly at the threshold is NOT a fling — |v| > threshold, so a
+        // flick at exactly 0.6 px/ms falls to the p tiers; a hair past it
+        // takes the fling path.
+        assert!(!commits_to_target(0.05, 0.6, FLING));
+        assert!(commits_to_target(0.05, 0.6001, FLING));
+        // The negative mirror, with p above the backward-biased 0.8 tier:
+        // exactly at -0.6 the tier commits, a hair past it the fling sign
+        // wins outright and bounces.
+        assert!(commits_to_target(0.95, -0.6, FLING));
+        assert!(!commits_to_target(0.95, -0.6001, FLING));
+    }
+
+    #[test]
+    fn every_routing_arm_maps_gesture_velocity_to_positive_forward() {
+        // Slice step 4: re-verify every (state, direction) arm against the
+        // sign mapping. For each arm a velocity in the gesture's own
+        // physical direction (down = +1 px/ms, up = -1 px/ms) must map to
+        // POSITIVE forward velocity — the fling tier commits to target on
+        // positive v_forward, so a sign error here inverts the fling and
+        // presents exactly as "inconsistent".
+        let arms: [(BarState, Direction, BarState); 6] = [
+            (BarState::Closed, Direction::Up, BarState::Detailed),
+            (BarState::Closed, Direction::Down, BarState::Hidden),
+            (BarState::Detailed, Direction::Down, BarState::Closed),
+            (BarState::Detailed, Direction::UpGrid, BarState::AppGrid),
+            (BarState::Hidden, Direction::Up, BarState::Closed),
+            (BarState::AppGrid, Direction::Down, BarState::Detailed),
+        ];
+        for (source, dir, target) in arms {
+            assert_eq!(begin_target(source, dir), Some(target));
+            let gesture_v = match dir {
+                Direction::Down => 1.0,
+                Direction::Up | Direction::UpGrid => -1.0,
+            };
+            let forward = forward_velocity(dir, gesture_v);
+            assert!(
+                forward > 0.0,
+                "{source:?} {dir:?}: forward velocity {forward} not positive"
+            );
+        }
+    }
+
+    #[test]
+    fn every_routing_arm_commits_on_a_full_forward_fling() {
+        // The flip side of the sign sweep: with the velocity sign mapping
+        // correct, a fling in the gesture direction must commit from ANY
+        // progress on every arm — this is "quick flick commits regardless
+        // of distance" stated per arm, including the astro-open arms.
+        let arms: [(BarState, Direction, BarState); 6] = [
+            (BarState::Closed, Direction::Up, BarState::Detailed),
+            (BarState::Closed, Direction::Down, BarState::Hidden),
+            (BarState::Detailed, Direction::Down, BarState::Closed),
+            (BarState::Detailed, Direction::UpGrid, BarState::AppGrid),
+            (BarState::Hidden, Direction::Up, BarState::Closed),
+            (BarState::AppGrid, Direction::Down, BarState::Detailed),
+        ];
+        for (source, dir, _target) in arms {
+            let gesture_v = match dir {
+                Direction::Down => 2.0,
+                Direction::Up | Direction::UpGrid => -2.0,
+            };
+            let forward = forward_velocity(dir, gesture_v);
+            assert!(
+                commits_to_target(0.05, forward, FLING),
+                "{source:?} {dir:?}: fling did not commit at low p"
+            );
+        }
     }
 }

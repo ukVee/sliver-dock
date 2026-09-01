@@ -216,12 +216,23 @@ fn apply_command(req: &mut ipc::Request, drag: &Rc<Drag>, app: &Application) {
         "toggle-detailed" => drag.toggle_detailed(),
         "quit" => app.quit(),
         "get-state" => ipc::reply(req, &format!("{}\n", drag.dump_state())),
-        "drag-begin" => match tokens.next() {
-            Some("up") => drag.begin(Direction::Up),
-            Some("down") => drag.begin(Direction::Down),
-            Some("up-grid") => drag.begin(Direction::UpGrid),
-            other => eprintln!("sliver-dock: drag-begin expects up|down|up-grid, got {:?}", other),
-        },
+        "drag-begin" => {
+            // Optional `zone=<id>` token after the direction (touch-drawer
+            // protocol extension, slice 003): names the zone that matched
+            // for the gesture-sample ring. Absent on pre-token plugin
+            // binaries — the gesture still routes, only the ring entry's
+            // zone stays unknown.
+            let direction = tokens.next();
+            let zone = tokens.find_map(|t| t.strip_prefix("zone=").map(str::to_owned));
+            match direction {
+                Some("up") => drag.begin(Direction::Up, zone),
+                Some("down") => drag.begin(Direction::Down, zone),
+                Some("up-grid") => drag.begin(Direction::UpGrid, zone),
+                other => {
+                    eprintln!("sliver-dock: drag-begin expects up|down|up-grid, got {other:?}")
+                }
+            }
+        }
         "drag" => {
             if let Some(p) = tokens.next().and_then(|s| s.parse::<f64>().ok()) {
                 drag.update(p);
@@ -2059,6 +2070,27 @@ fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
     };
     let reply = ipc::socket_path();
     let initial = drag.state();
+
+    // travel_px policy — decided deliberately in slice 003, kept from
+    // slices 001–002: every bounded zone keeps `travel_px = zone height`
+    // (only the full-screen bottom-edge band uses touch-drawer's default
+    // `screen_height / 3`). Two reasons, one negative, one positive:
+    //
+    //   * The midpoint must stay REACHABLE. A denominator larger than the
+    //     zone caps p at `zone / denominator`: a uniform denominator (e.g.
+    //     screen_height/3 ≈ 284 on the 107px detailed zone) would cap p at
+    //     ~0.38, below the 0.5 stationary tier — a slow drag could never
+    //     commit and close-by-slow-drag would be impossible.
+    //   * Progress must TRACK the finger 1:1 inside the zone's own extent.
+    //     The live drag visual lerps on p; zone-relative progress is the
+    //     only denominator that feels like the finger is pushing the dock.
+    //
+    // The asymmetry this leaves — a 10px commit is p≈0.48 on the 21px
+    // sliver edge but p≈0.09 on the detailed zone — only affects the
+    // sub-fling tier. Quick-flick decisiveness is the fling tier's job,
+    // and the fling test is zone-independent (velocity only). On a 21px
+    // handle a committed drag IS a near-full traversal, so near-saturated
+    // progress is correct there, not a defect.
 
     // Wide bottom-edge band — used to unhide from Hidden state. No
     // travel_px override; the unhide gesture has the full screen to play
