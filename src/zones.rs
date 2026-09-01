@@ -3,9 +3,24 @@
 //! connection per command, errors logged and swallowed — the dock must
 //! still boot if the plugin is down.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+
+thread_local! {
+    /// Last enabled value actually sent per zone id. `update_zone_states`
+    /// flips four flags on every state settle and most settles change
+    /// nothing — each `send` is a fresh connect → write → close on
+    /// `touch-drawer.sock`, so skipping an unchanged write is a real power
+    /// win on this fanless device (milestone slice 001, low-power item).
+    /// Deliberately NOT seeded at registration: if the register write
+    /// failed (plugin down at boot), the first settle must still re-send.
+    static LAST_ENABLED: RefCell<HashMap<String, bool>> = RefCell::new(HashMap::new());
+    /// Last bounds tuple actually sent per zone id, same rationale.
+    static LAST_BOUNDS: RefCell<HashMap<String, (i32, i32, i32, i32)>> = RefCell::new(HashMap::new());
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
@@ -113,16 +128,43 @@ pub fn register_bidir(
     send_or_log(&line, "register-bidir");
 }
 
+/// Send `line`, returning whether it reached the plugin. On failure the
+/// caller must NOT record it as the last-sent value — the next state settle
+/// re-sends and self-heals, which is how the dock recovers a plugin that
+/// was down mid-flight.
+fn send_tracked(line: &str, op: &str) -> bool {
+    match send(line) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("sliver-dock: zones {op}: {e}");
+            false
+        }
+    }
+}
+
 pub fn set_enabled(id: &str, enabled: bool) {
+    let last = LAST_ENABLED.with(|m| m.borrow().get(id).copied());
+    if last == Some(enabled) {
+        return;
+    }
     let line = format!(
         "set-enabled {} {}",
         id,
         if enabled { "true" } else { "false" }
     );
-    send_or_log(&line, "set-enabled");
+    if send_tracked(&line, "set-enabled") {
+        LAST_ENABLED.with(|m| m.borrow_mut().insert(id.to_owned(), enabled));
+    }
 }
 
 pub fn update_bounds(id: &str, x: i32, y: i32, w: i32, h: i32) {
+    let bounds = (x, y, w, h);
+    let last = LAST_BOUNDS.with(|m| m.borrow().get(id).copied());
+    if last == Some(bounds) {
+        return;
+    }
     let line = format!("update-bounds {} {} {} {} {}", id, x, y, w, h);
-    send_or_log(&line, "update-bounds");
+    if send_tracked(&line, "update-bounds") {
+        LAST_BOUNDS.with(|m| m.borrow_mut().insert(id.to_owned(), bounds));
+    }
 }

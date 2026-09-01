@@ -861,7 +861,6 @@ impl Drag {
             return;
         }
         let g = &self.geom;
-        let bar_w = g.width_px.min(win_w);
         // `win_h` is the real surface height (astro sizes it `screen_h - D`).
         // The bar is bottom-anchored, so the input region is measured up from
         // the bottom edge — never from a `margin+default+detailed(+grid)`
@@ -883,9 +882,7 @@ impl Drag {
             0
         };
 
-        let x = (win_w - bar_w) / 2;
-        let y = (bar_top - extend_up).max(0);
-        let h = win_h - y;
+        let (x, y, bar_w, h) = input_region_rect(win_w, win_h, g, extend_up);
 
         let rect = cairo::RectangleInt::new(x, y, bar_w, h);
         let region = cairo::Region::create_rectangle(&rect);
@@ -1127,6 +1124,23 @@ impl Drag {
     }
 }
 
+/// Pure input-region rectangle for a given surface size, geometry and
+/// upward expansion — the shared derivation behind `Drag::refresh_input_region`
+/// and the zone/input agreement test, so the two can't drift apart.
+///
+/// The bar is bottom-anchored; the region is measured up from the bottom edge
+/// and widened by `extend_up` (the detailed content height, or everything up
+/// to the surface top in AppGrid). Same "real surface height is the source of
+/// truth" rule as the draw path.
+pub(crate) fn input_region_rect(win_w: i32, win_h: i32, g: &Geometry, extend_up: i32) -> (i32, i32, i32, i32) {
+    let bar_w = g.width_px.min(win_w);
+    let bar_top = win_h - g.margin_bottom_px - g.default_height_px;
+    let x = (win_w - bar_w) / 2;
+    let y = (bar_top - extend_up).max(0);
+    let h = win_h - y;
+    (x, y, bar_w, h)
+}
+
 /// touch-drawer reports progress relative to its zone direction:
 ///   * Down zones:  0.0 (initial)  →  1.0 (committed)        — use as-is
 ///   * Up zones:    1.0 (initial)  →  0.0 (committed)        — invert
@@ -1157,28 +1171,61 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
-/// Flip touch-drawer zones based on the steady state. At most one is
-/// enabled at a time:
-///   * Closed   → bar zone (swipe up over the bar opens Detailed)
-///   * Hidden   → bottom-edge zone (swipe up at screen edge unhides)
-///   * Detailed → detailed bidir zone (swipe down anywhere on the
-///     expanded window closes to Closed; up arm is reserved for a
-///     future workspaces-section grid-expand gesture)
-fn update_zone_states(state: BarState, geom: &Geometry) {
-    zones::set_enabled(BAR_ZONE_ID, matches!(state, BarState::Closed));
-    zones::set_enabled(BOTTOM_EDGE_ZONE_ID, matches!(state, BarState::Hidden));
-    zones::set_enabled(DETAILED_ZONE_ID, false);
-    zones::set_enabled(
-        SLIVER_EDGE_ZONE_ID,
-        matches!(state, BarState::Closed | BarState::Detailed | BarState::AppGrid),
-    );
-    // The sliver-edge zone rides up with the detailed lift, so its screen-y
-    // is state-dependent — re-register its bounds on every state settle.
-    // Without this the swipe-open zone stayed pinned to the Closed position
-    // (`update_zone_bounds` only fires on map + monitor-change), so in the
-    // Detailed / AppGrid states the drag zone no longer sat over the visible
-    // sliver at the top of the detailed view.
+/// The intended enabled-zone set per steady state — the single source of
+/// truth. (There used to be two hand-written copies of this logic, one here
+/// and one in `panel.rs`'s map callback; they drifted — both hardcoded the
+/// detailed zone to `false` — and the drift is exactly what killed the
+/// Detailed swipe-down gesture. The map callback now calls
+/// [`update_zone_states`] instead of re-deriving the set.)
+///
+///   * Closed   → bar zone (up opens Detailed, down hides)
+///   * Hidden   → bottom-edge zone (up unhides)
+///   * Detailed → detailed bidir zone (down anywhere closes to Closed;
+///     up arm reserved for the app-grid, refined by slice 002) +
+///     sliver-edge (up-grid opens AppGrid from the astro bar)
+///   * AppGrid  → detailed zone extended over the astro body (down anywhere
+///     returns to Detailed) + sliver-edge (down also closes; up-grid is a
+///     no-op from AppGrid)
+fn intended_zones(state: BarState) -> [(&'static str, bool); 4] {
+    [
+        (BAR_ZONE_ID, matches!(state, BarState::Closed)),
+        (BOTTOM_EDGE_ZONE_ID, matches!(state, BarState::Hidden)),
+        (
+            DETAILED_ZONE_ID,
+            matches!(state, BarState::Detailed | BarState::AppGrid),
+        ),
+        (
+            SLIVER_EDGE_ZONE_ID,
+            matches!(state, BarState::Closed | BarState::Detailed | BarState::AppGrid),
+        ),
+    ]
+}
+
+/// Single-zone lookup over [`intended_zones`] — for registration-time and
+/// test callers that want one flag instead of the whole set.
+pub(crate) fn zone_enabled(state: BarState, zone: &str) -> bool {
+    intended_zones(state)
+        .into_iter()
+        .find(|(id, _)| *id == zone)
+        .map(|(_, enabled)| enabled)
+        .unwrap_or(false)
+}
+
+/// Flip touch-drawer zones based on the steady state. At most the intended
+/// set per state is enabled — see [`intended_zones`] for the table.
+///
+/// The two state-dependent zones (detailed + sliver-edge) also re-register
+/// their bounds on every state settle: the sliver-edge rides the detailed
+/// lift, and the detailed zone covers the astro body in AppGrid. Without
+/// this the swipe zones stayed pinned to the Closed geometry
+/// (`update_zone_bounds` only fires on map + monitor-change).
+pub(crate) fn update_zone_states(state: BarState, geom: &Geometry) {
+    for (id, enabled) in intended_zones(state) {
+        zones::set_enabled(id, enabled);
+    }
     if let Some((sw, sh)) = crate::panel::current_screen_size() {
+        let (x, y, w, h) = crate::panel::detailed_zone_bounds(sw, sh, geom, state);
+        zones::update_bounds(DETAILED_ZONE_ID, x, y, w, h);
         let (x, y, w, h) = crate::panel::sliver_edge_zone_bounds(sw, sh, geom, state);
         zones::update_bounds(SLIVER_EDGE_ZONE_ID, x, y, w, h);
     }
@@ -1266,5 +1313,101 @@ mod tests {
         assert_ne!(Direction::Up, Direction::Down);
         assert_ne!(Direction::Up, Direction::UpGrid);
         assert_ne!(Direction::Down, Direction::UpGrid);
+    }
+
+    // ---- slice 001: per-state enabled-zone table ----------------------
+
+    #[test]
+    fn intended_zones_have_no_dead_registered_zone() {
+        // Every zone id we register must be enabled in at least one state —
+        // the slice-001 regression the two hardcoded `false` calls caused
+        // (the detailed zone was registered and then permanently dead).
+        let ids = [
+            BAR_ZONE_ID,
+            BOTTOM_EDGE_ZONE_ID,
+            DETAILED_ZONE_ID,
+            SLIVER_EDGE_ZONE_ID,
+        ];
+        let states = [
+            BarState::Closed,
+            BarState::Hidden,
+            BarState::Detailed,
+            BarState::AppGrid,
+        ];
+        for id in ids {
+            assert!(
+                states.iter().any(|&s| zone_enabled(s, id)),
+                "{id} is registered but never enabled in any state"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_enables_only_bar_and_sliver_edge() {
+        let s = BarState::Closed;
+        assert!(zone_enabled(s, BAR_ZONE_ID));
+        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID));
+        assert!(!zone_enabled(s, BOTTOM_EDGE_ZONE_ID));
+        assert!(!zone_enabled(s, DETAILED_ZONE_ID));
+    }
+
+    #[test]
+    fn hidden_enables_only_bottom_edge() {
+        let s = BarState::Hidden;
+        assert!(zone_enabled(s, BOTTOM_EDGE_ZONE_ID));
+        assert!(!zone_enabled(s, BAR_ZONE_ID));
+        assert!(!zone_enabled(s, DETAILED_ZONE_ID));
+        assert!(!zone_enabled(s, SLIVER_EDGE_ZONE_ID));
+    }
+
+    #[test]
+    fn detailed_enables_detailed_and_sliver_edge() {
+        let s = BarState::Detailed;
+        assert!(zone_enabled(s, DETAILED_ZONE_ID), "the revived zone");
+        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID));
+        assert!(!zone_enabled(s, BAR_ZONE_ID));
+        assert!(!zone_enabled(s, BOTTOM_EDGE_ZONE_ID));
+    }
+
+    #[test]
+    fn app_grid_enables_detailed_and_sliver_edge() {
+        let s = BarState::AppGrid;
+        assert!(zone_enabled(s, DETAILED_ZONE_ID), "down-close zone");
+        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID));
+        assert!(!zone_enabled(s, BAR_ZONE_ID));
+        assert!(!zone_enabled(s, BOTTOM_EDGE_ZONE_ID));
+    }
+
+    #[test]
+    fn unknown_zone_id_is_never_enabled() {
+        assert!(!zone_enabled(BarState::Detailed, "sliver-dock.nope"));
+    }
+
+    #[test]
+    fn input_region_rect_matches_the_bar_for_closed() {
+        let g = Geometry::default();
+        let (win_w, win_h) = (1280, 746);
+        let (x, y, w, h) = input_region_rect(win_w, win_h, &g, 0);
+        assert_eq!(w, g.width_px.min(win_w));
+        // Closed: the region is just the bar + margin band at the bottom.
+        assert_eq!(h, g.margin_bottom_px + g.default_height_px);
+        assert_eq!(x, (win_w - w) / 2);
+        assert_eq!(y, win_h - h);
+    }
+
+    #[test]
+    fn input_region_rect_expands_up_for_detailed() {
+        let g = Geometry::default();
+        let (win_w, win_h) = (1280, 746);
+        let (x, y, w, h) = input_region_rect(win_w, win_h, &g, g.detailed_content_height_px);
+        assert_eq!(w, g.width_px.min(win_w));
+        // Detailed: the region grows by the detailed content height, up from
+        // the bar + margin band.
+        assert_eq!(
+            h,
+            g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px
+        );
+        assert_eq!(y, win_h - h);
+        assert_eq!(x, (win_w - w) / 2);
     }
 }

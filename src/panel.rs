@@ -103,13 +103,11 @@ fn on_activate(app: &Application) {
         update_zone_bounds(&geom_for_map, s);
         // Re-derive zone enabled flags now that the surface is mapped —
         // `set_visible(true)` in jump_to / ensure_mapped can race the map.
-        zones::set_enabled(drag::BOTTOM_EDGE_ZONE_ID, matches!(s, BarState::Hidden));
-        zones::set_enabled(drag::BAR_ZONE_ID, matches!(s, BarState::Closed));
-        zones::set_enabled(drag::DETAILED_ZONE_ID, false);
-        zones::set_enabled(
-            drag::SLIVER_EDGE_ZONE_ID,
-            matches!(s, BarState::Closed | BarState::Detailed | BarState::AppGrid),
-        );
+        // One shared source of truth (`drag::update_zone_states`): the map
+        // callback and the settle path must never hand-roll their own copies
+        // of the enabled-set again — the drift between two copies is exactly
+        // what killed the Detailed swipe-down zone.
+        drag::update_zone_states(s, &geom_for_map);
         drag_for_map.refresh_input_region();
     });
 
@@ -1896,6 +1894,16 @@ pub(crate) fn current_screen_size() -> Option<(i32, i32)> {
 }
 
 fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
+    // Registration-order contract: touch-drawer's `classify()` linear-scans
+    // the registry and returns the FIRST enabled zone whose rect contains
+    // the touch-down point (touch-drawer/src/main.cpp:273). Overlapping
+    // zones are therefore resolved by registration order — narrow/specific
+    // zones must be registered BEFORE broad ones, or the specific gesture
+    // silently stops firing. Current shape: bottom-edge band and the
+    // sliver-edge strip (both narrow) before the bar zone (medium) and the
+    // detailed zone (broad — covers the whole dock surface, and the whole
+    // astro body in AppGrid). A future re-order changes gesture routing
+    // without a compile error, so edit this order deliberately.
     let Some((sw, sh)) = current_screen_size() else {
         eprintln!("sliver-dock: no monitor 0; touch-drawer zones not registered");
         return;
@@ -1915,7 +1923,7 @@ fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
         zones::Direction::Up,
         &reply,
         "up",
-        matches!(initial, BarState::Hidden),
+        drag::zone_enabled(initial, drag::BOTTOM_EDGE_ZONE_ID),
         None,
     );
 
@@ -1934,34 +1942,18 @@ fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
         &reply,
         "up",
         "down",
-        matches!(initial, BarState::Closed),
+        drag::zone_enabled(initial, drag::BAR_ZONE_ID),
         Some(bh),
-    );
-
-    // Detailed-view bidir zone — covers the full visible expanded window
-    // (bar + margin + detailed content), centered horizontally on the
-    // spear. Down resolves the close gesture (Detailed → Closed); up is
-    // a no-op for now, parked for the future workspaces-section grid
-    // expand. Enabled only in Detailed state. travel_px = zone height so
-    // close-gesture progress maxes out within the visible window.
-    let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, geom);
-    zones::register_bidir(
-        drag::DETAILED_ZONE_ID,
-        dx,
-        dy,
-        dw,
-        dh,
-        &reply,
-        "up",
-        "down",
-        matches!(initial, BarState::Detailed),
-        Some(dh),
     );
 
     // Sliver-edge bidir zone — 15px strip above the sliver bar. Up triggers
     // the app-grid (UpGrid direction); down is a no-op in this zone. Uses
     // travel_px=15 so a short swipe saturates progress. Enabled in Closed,
     // Detailed, and AppGrid states.
+    //
+    // Registered BEFORE the detailed zone: in AppGrid the sliver-edge strip
+    // sits inside the astro body covered by the (extended) detailed zone, so
+    // narrow-first ordering keeps the strip's own routing authoritative.
     let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom, initial);
     zones::register_bidir(
         drag::SLIVER_EDGE_ZONE_ID,
@@ -1972,8 +1964,29 @@ fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
         &reply,
         "up-grid",
         "down",
-        matches!(initial, BarState::Closed | BarState::Detailed | BarState::AppGrid),
+        drag::zone_enabled(initial, drag::SLIVER_EDGE_ZONE_ID),
         Some(sh_z),
+    );
+
+    // Detailed-view bidir zone — covers the full visible expanded window
+    // (bar + margin + detailed content) in Detailed, and the whole astro
+    // body in AppGrid (state-dependent bounds, re-registered on every
+    // settle by `drag::update_zone_states`). Down resolves the close
+    // gesture (Detailed → Closed, AppGrid → Detailed); up is the app-grid
+    // arm, refined by slice 002. travel_px = zone height so the
+    // close-gesture progress maxes out within the visible window.
+    let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, geom, initial);
+    zones::register_bidir(
+        drag::DETAILED_ZONE_ID,
+        dx,
+        dy,
+        dw,
+        dh,
+        &reply,
+        "up",
+        "down",
+        drag::zone_enabled(initial, drag::DETAILED_ZONE_ID),
+        Some(dh),
     );
 }
 
@@ -1988,9 +2001,11 @@ fn update_zone_bounds(geom: &Geometry, state: BarState) {
     );
     let (bx, by, bw, bh) = bar_zone_bounds(sw, sh, geom);
     zones::update_bounds(drag::BAR_ZONE_ID, bx, by, bw, bh);
-    let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, geom);
+    // Detailed + sliver-edge zones are state-dependent (the detailed zone
+    // extends over the astro body in AppGrid; the sliver rides the detailed
+    // lift) — mirror the state passed in.
+    let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, geom, state);
     zones::update_bounds(drag::DETAILED_ZONE_ID, dx, dy, dw, dh);
-    // Sliver-edge zone is state-dependent (rides up with the detailed lift).
     let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom, state);
     zones::update_bounds(drag::SLIVER_EDGE_ZONE_ID, sx, sy, sw_z, sh_z);
 }
@@ -2005,15 +2020,33 @@ fn bar_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i32) {
     (x, y, bar_w, h)
 }
 
-/// Detailed zone covers the entire visible expanded window — bar +
-/// margin + detailed content height — centered horizontally on the
-/// spear. Same horizontal extent as the bar zone, taller.
-fn detailed_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i32) {
+/// Detailed zone covers the visible expanded window — bar + margin +
+/// detailed content height — centered horizontally on the spear. Same
+/// horizontal extent as the bar zone, taller.
+///
+/// **State-dependent** (mirroring [`sliver_edge_zone_bounds`]): in
+/// `AppGrid` the surface is `screen_h - D` tall and the astro rect spans
+/// screen `[D, h-D]`, so the bottom-anchored dock-stack bounds would not
+/// reach the astro body at all. The zone extends to cover the whole astro
+/// body — that is the down-close gesture's target surface in AppGrid.
+pub(crate) fn detailed_zone_bounds(
+    sw: i32,
+    sh: i32,
+    geom: &Geometry,
+    state: BarState,
+) -> (i32, i32, i32, i32) {
     let bar_w = geom.width_px.min(sw);
-    let h = geom.margin_bottom_px + geom.default_height_px + geom.detailed_content_height_px;
     let x = (sw - bar_w) / 2;
-    let y = sh - h;
-    (x, y, bar_w, h)
+
+    if matches!(state, BarState::AppGrid) {
+        // Astro body spans screen `[D, h-D]`; the zone covers exactly that.
+        let d = dock_stack_px(geom);
+        let h = (sh - 2 * d).max(0);
+        return (x, d, bar_w, h);
+    }
+
+    let h = geom.margin_bottom_px + geom.default_height_px + geom.detailed_content_height_px;
+    (x, sh - h, bar_w, h)
 }
 
 /// Sliver-edge zone — the astro sliver's grab target. Full bar width,
@@ -2608,6 +2641,102 @@ mod tests {
             assert_eq!(w, g.width_px);
             assert_eq!(x, (1280 - g.width_px) / 2);
         }
+    }
+
+    // ---- slice 001: state-dependent detailed zone + input agreement ----
+
+    #[test]
+    fn detailed_zone_covers_the_dock_stack_when_closed_or_detailed() {
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        let want_h = g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px;
+        for state in [BarState::Closed, BarState::Detailed] {
+            let (x, y, w, h) = detailed_zone_bounds(sw, sh, &g, state);
+            assert_eq!(h, want_h, "{state:?}");
+            assert_eq!(y, sh - want_h, "{state:?}");
+            assert_eq!(w, g.width_px);
+            assert_eq!(x, (sw - g.width_px) / 2);
+        }
+    }
+
+    #[test]
+    fn detailed_zone_extends_over_the_astro_body_in_app_grid() {
+        // In AppGrid the surface is `screen_h - D` tall and the astro rect
+        // spans screen `[D, h-D]`; the bottom-anchored dock-stack bounds
+        // would not reach a single pixel of it. The zone must cover the
+        // astro body — the down-close gesture's target surface.
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        let d = dock_stack_px(&g);
+        let (x, y, w, h) = detailed_zone_bounds(sw, sh, &g, BarState::AppGrid);
+        assert_eq!(y, d, "starts at the top of the astro rect (screen y = D)");
+        assert_eq!(h, sh - 2 * d, "spans exactly the astro body [D, h-D]");
+        assert_eq!(w, g.width_px);
+        assert_eq!(x, (sw - g.width_px) / 2);
+    }
+
+    #[test]
+    fn detailed_zone_reaches_the_astro_body_but_closed_does_not() {
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        // The pre-slice bug: `detailed_zone_bounds` had no state parameter,
+        // so AppGrid used the Closed/Detailed bounds — entirely below the
+        // astro body, leaving the astro view with no down-close zone.
+        let d = dock_stack_px(&g);
+        let (_, grid_y, _, grid_h) = detailed_zone_bounds(sw, sh, &g, BarState::AppGrid);
+        let (_, closed_y, _, closed_h) = detailed_zone_bounds(sw, sh, &g, BarState::Closed);
+        assert!(grid_y < closed_y, "AppGrid zone starts above the Closed one");
+        assert!(grid_h > closed_h, "AppGrid zone is taller than the Closed one");
+        assert!(grid_y < d + g.detailed_content_height_px, "reaches the astro body");
+    }
+
+    /// Input-region derivation for the same surface, in screen coords —
+    /// mirrors `Drag::refresh_input_region` via the shared pure
+    /// `drag::input_region_rect`, so this test asserts the two derivations
+    /// (touch zones vs client input region) agree.
+    fn input_region_screen(sw: i32, sh: i32, g: &Geometry, state: BarState) -> (i32, i32, i32, i32) {
+        // The window is `screen_h - D` tall and bottom-anchored, so its top
+        // edge sits at screen y = D.
+        let win_h = sh - dock_stack_px(g);
+        let extend_up = if state == BarState::AppGrid {
+            // grid_expand_needed: cover the whole surface above the bar.
+            (win_h - g.margin_bottom_px - g.default_height_px).max(0)
+        } else if state == BarState::Detailed {
+            g.detailed_content_height_px
+        } else {
+            0
+        };
+        let (x, y, w, h) = drag::input_region_rect(sw, win_h, g, extend_up);
+        (x, y + dock_stack_px(g), w, h)
+    }
+
+    #[test]
+    fn detailed_zone_agrees_with_the_input_region() {
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        let zone = detailed_zone_bounds(sw, sh, &g, BarState::Detailed);
+        let input = input_region_screen(sw, sh, &g, BarState::Detailed);
+        assert_eq!(zone, input, "Detailed zone must match the client input region");
+    }
+
+    #[test]
+    fn app_grid_zone_sits_inside_the_input_region() {
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        let (zx, zy, zw, zh) = detailed_zone_bounds(sw, sh, &g, BarState::AppGrid);
+        let (ix, iy, iw, ih) = input_region_screen(sw, sh, &g, BarState::AppGrid);
+        assert!(zx >= ix && zy >= iy, "zone must start inside the input region");
+        assert!(zx + zw <= ix + iw, "zone must end inside the input region");
+        assert!(zy + zh <= iy + ih, "zone must end inside the input region");
+    }
+
+    #[test]
+    fn bar_zone_agrees_with_the_input_region_when_closed() {
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        let zone = bar_zone_bounds(sw, sh, &g);
+        let input = input_region_screen(sw, sh, &g, BarState::Closed);
+        assert_eq!(zone, input, "Closed bar zone must match the client input region");
     }
 }
 
