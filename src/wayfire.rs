@@ -312,16 +312,16 @@ fn fetch_output_state() -> std::io::Result<OutputState> {
         .get("geometry")
         .ok_or_else(|| std::io::Error::other("no geometry field"))?;
     let workspace = WorkspaceId {
-        x: ws.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-        y: ws.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        x: ws.get("x").and_then(json_i64).unwrap_or(0) as i32,
+        y: ws.get("y").and_then(json_i64).unwrap_or(0) as i32,
     };
     let grid = GridSize {
-        width: ws.get("grid_width").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
-        height: ws.get("grid_height").and_then(|v| v.as_i64()).unwrap_or(1) as i32,
+        width: ws.get("grid_width").and_then(json_i64).unwrap_or(1) as i32,
+        height: ws.get("grid_height").and_then(json_i64).unwrap_or(1) as i32,
     };
     let output_size = (
-        geom.get("width").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-        geom.get("height").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+        geom.get("width").and_then(json_i64).unwrap_or(0) as i32,
+        geom.get("height").and_then(json_i64).unwrap_or(0) as i32,
     );
     Ok(OutputState {
         workspace,
@@ -355,12 +355,21 @@ struct ViewInfo {
 }
 
 /// Read a geometry object (`{x, y, width, height}`) from a JSON value.
+/// Wayfire emits geometry as JSON numbers that are often floats (`1280.0`,
+/// `-1275.0`) — serde_json's `as_i64` returns `None` for any float-backed
+/// number, even an integral one, so raw `as_i64` reads of coordinates made
+/// the whole live view pipeline silently drop every view (the 2026-09-01
+/// montage-empty bug). Parse through this tolerant helper instead.
+fn json_i64(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+}
+
 fn geometry_rect(geom: &Value) -> Option<ViewRect> {
     Some(ViewRect {
-        x: geom.get("x")?.as_i64()? as i32,
-        y: geom.get("y")?.as_i64()? as i32,
-        w: geom.get("width")?.as_i64()? as i32,
-        h: geom.get("height")?.as_i64()? as i32,
+        x: json_i64(geom.get("x")?)? as i32,
+        y: json_i64(geom.get("y")?)? as i32,
+        w: json_i64(geom.get("width")?)? as i32,
+        h: json_i64(geom.get("height")?)? as i32,
     })
 }
 
@@ -947,8 +956,8 @@ fn process_event(
         "wset-workspace-changed" => {
             let Some(new) = frame.get("new-workspace") else { return };
             let workspace = WorkspaceId {
-                x: new.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-                y: new.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                x: new.get("x").and_then(json_i64).unwrap_or(0) as i32,
+                y: new.get("y").and_then(json_i64).unwrap_or(0) as i32,
             };
             let output_id = frame.get("output").and_then(|v| v.as_i64()).unwrap_or(0);
             t.state.workspace = workspace;
@@ -1069,8 +1078,8 @@ fn process_event(
             let Some(id) = view.get("id").and_then(|v| v.as_i64()) else { return };
             let Some(to) = frame.get("to") else { return };
             let workspace = WorkspaceId {
-                x: to.get("x").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
-                y: to.get("y").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                x: to.get("x").and_then(json_i64).unwrap_or(0) as i32,
+                y: to.get("y").and_then(json_i64).unwrap_or(0) as i32,
             };
             let app_id = view
                 .get("app-id")
@@ -1325,6 +1334,61 @@ mod tests {
         // Removing the last id of a workspace prunes the entry.
         stack_remove_anywhere(&mut stack, 8);
         assert!(!stack.contains_key(&ws_b));
+    }
+
+    // ---- regression 2026-09-01: wayfire emits float geometry ------------
+
+    /// The live payload shape: every coordinate is a float (`-1275.0`,
+    /// `5.0`, ...). `as_i64` alone reads these as `None`, which silently
+    /// dropped every view (empty montages on device). `json_i64` must read
+    /// both float and integer forms.
+    #[test]
+    fn json_i64_reads_floats_and_ints() {
+        assert_eq!(json_i64(&json!(1280.0)), Some(1280));
+        assert_eq!(json_i64(&json!(-1275.0)), Some(-1275));
+        assert_eq!(json_i64(&json!(0.0)), Some(0));
+        assert_eq!(json_i64(&json!(1280)), Some(1280));
+        assert_eq!(json_i64(&json!("x")), None);
+    }
+
+    /// A view whose geometry arrives as floats — exactly what
+    /// `window-rules/list-views` returns on device — must extract to the
+    /// same workspace + workspace-local rect as the integer form.
+    #[test]
+    fn extract_view_reads_float_geometry() {
+        let live = json!({
+            "id": 4, "layer": "workspace", "mapped": true, "sticky": false,
+            "app-id": "foot", "fullscreen": false,
+            "geometry": { "x": -1275.0, "y": 5.0, "width": 630.0, "height": 843.0 },
+        });
+        let (id, info) = extract_view(&live, OUT, WorkspaceId { x: 1, y: 0 })
+            .expect("float geometry tracked");
+        assert_eq!(id, 4);
+        // Raw x=−1275 is one workspace LEFT of focused (1,0) → ws(0,0),
+        // local x = −1275 + 1280 = 5.
+        assert_eq!(info.workspace, WorkspaceId { x: 0, y: 0 });
+        assert_eq!(info.rect, ViewRect { x: 5, y: 5, w: 630, h: 843 });
+    }
+
+    /// The end-to-end shape of the bug: a float-geometry list-views payload
+    /// must seed montage records, not an empty map (the user-visible empty
+    /// workspace icons on device).
+    #[test]
+    fn seed_from_float_list_views_populates_workspace_views() {
+        let views = vec![
+            json!({ "id": 4, "layer": "workspace", "mapped": true, "sticky": false,
+                    "app-id": "foot", "fullscreen": false,
+                    "geometry": { "x": 5.0, "y": 5.0, "width": 629.0, "height": 843.0 } }),
+            json!({ "id": 8, "layer": "workspace", "mapped": true, "sticky": false,
+                    "app-id": "foot", "fullscreen": false,
+                    "geometry": { "x": 644.0, "y": 5.0, "width": 631.0, "height": 843.0 } }),
+        ];
+        let (by_id, stack) = seed_from_list_views(views, OUT, WS0);
+        let out = views_in_order(&by_id, &stack);
+        let recs = &out[&WS0];
+        assert_eq!(recs.len(), 2, "two foots survive the float payload");
+        assert_eq!(recs[0].rect, ViewRect { x: 5, y: 5, w: 629, h: 843 });
+        assert_eq!(recs[1].rect, ViewRect { x: 644, y: 5, w: 631, h: 843 });
     }
 
     // ---- slice 007: live geometry (frame race, coalescing, quantise) ---
