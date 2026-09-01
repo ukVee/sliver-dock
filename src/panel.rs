@@ -841,6 +841,11 @@ fn draw_workspace_icons(
         ctx.set_source_rgba(bg.0, bg.1, bg.2, f_alpha * alpha);
         let _ = ctx.fill();
 
+        // Empty montage = the NORMAL empty-workspace look (slice 004: every
+        // grid cell renders an icon, empty or not) — the bare rounded slot
+        // below is the intentional placeholder, not a failed icon load. The
+        // current-workspace emphasis (fill/border alpha + border width)
+        // stays exactly as-is.
         if !montage.is_empty() {
             draw_montage(ctx, *rect, &montage, drag, alpha);
         }
@@ -1663,9 +1668,14 @@ fn handle_app_tap(drag: &Rc<Drag>, entry: &AppEntry) {
         return;
     };
 
-    if let (Some(grid), Some(output_id)) = (drag.grid(), drag.wayfire_output_id()) {
+    // `grid` is the full wayfire grid (1×1 in degraded mode); placement
+    // logic only runs with a real output id, so the no-compositor path is
+    // untouched. Still keyed off `opened_workspaces` — NOT the rendered
+    // row — per slice 004 (the render set is the whole grid, which would
+    // make `first_free_workspace` always return None).
+    if let Some(output_id) = drag.wayfire_output_id() {
         let opened = drag.opened_workspaces();
-        if let Some(target) = first_free_workspace(grid, &opened)
+        if let Some(target) = first_free_workspace(drag.grid(), &opened)
             && target != drag.current_workspace()
                 && let Err(e) = wayfire::set_workspace(target, output_id) {
                     eprintln!(
@@ -1721,7 +1731,7 @@ fn handle_terminal_tap(drag: &Rc<Drag>) {
             return;
         }
 
-    let Some(grid) = drag.grid() else { return };
+    let grid = drag.grid();
     let opened = drag.opened_workspaces();
     let target = first_free_workspace(grid, &opened).unwrap_or_else(|| drag.current_workspace());
     let Some(output_size) = drag.output_size() else {
@@ -2554,6 +2564,30 @@ mod tests {
     fn row_layout_empty() {
         let rects = row_layout(0.0, 200.0, 200.0, 66.0, 0, 0.0);
         assert!(rects.is_empty());
+    }
+
+    // ---- slice 004: the workspaces row fits the full grid --------------
+
+    #[test]
+    fn workspaces_section_fits_the_full_grid_at_device_width() {
+        // Device: width_px = 900, INFO_SECTION_W = 72, mid_gap 6 → the
+        // workspaces section is (900 − 72 − 12)/2 = 408px wide. All four
+        // 2×2 grid cells (4×41 + 3×8 = 188px) must fit with room to spare —
+        // a future width_px / INFO_SECTION_W / ICON_SIZE change that would
+        // start truncating workspaces fails loudly here.
+        let g = Geometry::default();
+        let main_w = section_bounds(1280.0, 746.0, &g).ws.1;
+        assert_eq!(main_w, 408.0, "device workspaces section width drifted");
+        let rects = row_layout(0.0, main_w, 200.0, 66.0, 4, 0.0);
+        assert_eq!(rects.len(), 4, "all four 2×2 workspaces must fit");
+        assert!(
+            rects[3].x + rects[3].w <= main_w + 1e-9,
+            "last icon must not overrun the section"
+        );
+        // max_fit pin: exactly 8 icons fit at 408px; a 9th truncates (the
+        // 3×3 grid's ninth workspace would be clipped, not crash).
+        assert_eq!(row_layout(0.0, main_w, 200.0, 66.0, 8, 0.0).len(), 8);
+        assert_eq!(row_layout(0.0, main_w, 200.0, 66.0, 9, 0.0).len(), 8);
     }
 
     // ---- astro slice 2: sliver fusion + travel -------------------------

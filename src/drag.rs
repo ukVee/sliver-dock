@@ -168,9 +168,10 @@ pub struct Drag {
     visual: Cell<Visual>,
     session: RefCell<Option<Session>>,
     animation: RefCell<Option<glib::SourceId>>,
-    /// Wayfire workspace grid (e.g. 2×2). Populated by the wayfire
-    /// subscriber on Connected; `None` while the dock is in degraded mode.
-    grid: Cell<Option<GridSize>>,
+    /// Wayfire workspace grid (e.g. 2×2). Set by the wayfire subscriber on
+    /// Connected; stays 1×1 in degraded mode (no compositor) — the rendered
+    /// row then shows the single current workspace.
+    grid: Cell<GridSize>,
     /// Wayfire output ID of the focused output. Needed for outbound
     /// `vswitch/set-workspace` calls (target output must be specified).
     /// Updated alongside `grid` from the wayfire subscriber.
@@ -314,7 +315,7 @@ impl Drag {
             visual: Cell::new(BarState::Detailed.into()),
             session: RefCell::new(None),
             animation: RefCell::new(None),
-            grid: Cell::new(None),
+            grid: Cell::new(GridSize { width: 1, height: 1 }),
             wayfire_output_id: Cell::new(None),
             opened_workspaces: RefCell::new(HashSet::new()),
             apps: RefCell::new(Vec::new()),
@@ -412,13 +413,13 @@ impl Drag {
         self.current_ws.get()
     }
 
-    #[allow(dead_code)] // 3x3 mini-grid expansion (deferred touch-drawer plan)
-    pub fn grid(&self) -> Option<GridSize> {
+    /// The Wayfire workspace grid (e.g. 2×2); 1×1 in degraded mode.
+    pub fn grid(&self) -> GridSize {
         self.grid.get()
     }
 
     pub fn set_grid(&self, grid: GridSize) {
-        self.grid.set(Some(grid));
+        self.grid.set(grid);
         self.area.queue_draw();
     }
 
@@ -431,8 +432,12 @@ impl Drag {
     }
 
     pub fn set_opened_workspaces(&self, set: HashSet<WorkspaceId>) {
+        // Deliberately NO queue_draw (slice 004 low-power): the rendered row
+        // is the full grid and no longer depends on the opened set — only the
+        // montages do, and those arrive via `set_workspace_app_montages` with
+        // their own change-gated redraw. The set is kept for app-launch
+        // placement (`panel::first_free_workspace`), not for rendering.
         *self.opened_workspaces.borrow_mut() = set;
-        self.area.queue_draw();
     }
 
     /// Snapshot the opened-workspaces set. Cheap clone (≤ grid_w × grid_h
@@ -442,13 +447,14 @@ impl Drag {
         self.opened_workspaces.borrow().clone()
     }
 
-    /// Workspaces to render in the section: the union of opened workspaces
-    /// (those with at least one toplevel view) with the currently focused
-    /// workspace, sorted row-major (y first, then x).
+    /// Workspaces to render in the section: every cell of the Wayfire grid,
+    /// row-major (y then x) — the whole grid renders at all times, empty or
+    /// not (locked user decision 2026-09-01). Degraded mode (grid 1×1) yields
+    /// the single current workspace, so the no-compositor path is unchanged.
     pub fn rendered_workspaces(&self) -> Vec<WorkspaceId> {
-        let mut set: HashSet<WorkspaceId> = self.opened_workspaces.borrow().clone();
-        set.insert(self.current_ws.get());
-        let mut out: Vec<WorkspaceId> = set.into_iter().collect();
+        let mut out = grid_workspaces(self.grid.get());
+        // Downstream callers (draw + hit-test) rely on the row-major order;
+        // sort defensively even though the enumeration is already row-major.
         out.sort_by(|a, b| a.y.cmp(&b.y).then_with(|| a.x.cmp(&b.x)));
         out
     }
@@ -789,8 +795,17 @@ impl Drag {
                 )
             })
             .collect();
+        // Rendered workspace row (slice 004) — the full grid in row-major
+        // draw order, so the row is assertable without a screenshot (the
+        // same order `draw_workspace_icons` paints and the click handler
+        // hit-tests).
+        let rendered: Vec<String> = self
+            .rendered_workspaces()
+            .iter()
+            .map(|w| format!(r#"{{"x":{},"y":{}}}"#, w.x, w.y))
+            .collect();
         format!(
-            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"gestures":[{}],"planets":[{}],"sky":{}}}"#,
+            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"rendered":[{}],"gestures":[{}],"planets":[{}],"sky":{}}}"#,
             self.state.get().as_str(),
             v.hidden_amount,
             v.detailed_amount,
@@ -800,6 +815,7 @@ impl Drag {
             ws.x,
             ws.y,
             entries.join(","),
+            rendered.join(","),
             gestures.join(","),
             planets.join(","),
             self.dump_sky(),
@@ -1197,6 +1213,21 @@ impl Drag {
         };
         self.snap_to_state(target);
     }
+}
+
+/// Every cell of the Wayfire grid, row-major (y then x) — the full render
+/// set for the workspaces section (slice 004). Pure so the 2×2 / 1×1 / 3×3
+/// enumeration is unit-testable without a GTK window. Degenerate (≤ 0)
+/// grid dimensions yield an empty row — the safe no-compositor fallback.
+pub(crate) fn grid_workspaces(grid: GridSize) -> Vec<WorkspaceId> {
+    let cap = (grid.width * grid.height).max(0) as usize;
+    let mut out = Vec::with_capacity(cap);
+    for y in 0..grid.height {
+        for x in 0..grid.width {
+            out.push(WorkspaceId { x, y });
+        }
+    }
+    out
 }
 
 /// The snap-decision tier, extracted pure (slice 003) so the flick cases at
@@ -1689,6 +1720,48 @@ mod tests {
                 "{source:?} {dir:?}: forward velocity {forward} not positive"
             );
         }
+    }
+
+    // ---- slice 004: the workspace row is the full grid ------------------
+
+    #[test]
+    fn grid_workspaces_2x2_is_four_row_major() {
+        let ws = grid_workspaces(GridSize { width: 2, height: 2 });
+        assert_eq!(
+            ws,
+            vec![
+                WorkspaceId { x: 0, y: 0 },
+                WorkspaceId { x: 1, y: 0 },
+                WorkspaceId { x: 0, y: 1 },
+                WorkspaceId { x: 1, y: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn grid_workspaces_1x1_is_the_single_workspace() {
+        let ws = grid_workspaces(GridSize { width: 1, height: 1 });
+        assert_eq!(ws, vec![WorkspaceId { x: 0, y: 0 }]);
+    }
+
+    #[test]
+    fn grid_workspaces_3x3_is_nine_row_major() {
+        let ws = grid_workspaces(GridSize { width: 3, height: 3 });
+        assert_eq!(ws.len(), 9);
+        // Row-major: y is the outer loop, x the inner — the render order.
+        for (i, w) in ws.iter().enumerate() {
+            assert_eq!(w.y, (i / 3) as i32, "y is the outer loop at {i}");
+            assert_eq!(w.x, (i % 3) as i32, "x is the inner loop at {i}");
+        }
+    }
+
+    #[test]
+    fn grid_workspaces_degenerate_dims_are_empty() {
+        // A non-positive grid dimension must degrade to an empty row (the
+        // renderer skips the section) rather than panic or emit garbage.
+        assert!(grid_workspaces(GridSize { width: 0, height: 0 }).is_empty());
+        assert!(grid_workspaces(GridSize { width: 2, height: 0 }).is_empty());
+        assert!(grid_workspaces(GridSize { width: -1, height: 2 }).is_empty());
     }
 
     #[test]
