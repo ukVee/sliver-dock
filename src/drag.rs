@@ -31,7 +31,7 @@ use crate::config::{Animation, Astro, Behaviour, Geometry, Terminal};
 use crate::launches;
 use crate::cpu::CpuInfo;
 use crate::state::{BarState, WorkspaceId};
-use crate::wayfire::GridSize;
+use crate::wayfire::{GridSize, MontageView};
 use crate::zones;
 
 pub const BOTTOM_EDGE_ZONE_ID: &str = "sliver-dock.bottom-edge";
@@ -242,13 +242,13 @@ pub struct Drag {
     /// per-workspace state map diverges from this snapshot; on exit we
     /// detect that and skip the restore (user override wins).
     pre_fullscreen: RefCell<HashMap<WorkspaceId, BarState>>,
-    /// Per-workspace ordered app-id list, MRU-first, deduped by app-id.
-    /// Driven by the wayfire `WorkspaceAppMontagesChanged` event;
-    /// projected into the per-workspace icon montage by
-    /// `panel.rs::draw_workspace_icons`. Truncation to 4 + the `+N`
-    /// overflow badge live in the renderer (see `montage_cells` and
-    /// `draw_overflow_badge`).
-    workspace_app_montages: RefCell<HashMap<WorkspaceId, Vec<String>>>,
+    /// Per-workspace ordered toplevel-view records — one per open window,
+    /// no app-id dedupe, stacking order bottom → top (topmost last).
+    /// Driven by the wayfire `WorkspaceViewsChanged` event; painted by
+    /// `panel.rs::draw_workspace_icons` (interim 1/2/3/4-cell partition +
+    /// the `+N` badge until slice 006's spatial cells). Empty app-ids are
+    /// kept — the renderer draws a fallback glyph for them.
+    workspace_views: RefCell<HashMap<WorkspaceId, Vec<MontageView>>>,
     /// App-ids tapped but not yet seen in the `running` set. Drives the
     /// per-icon spinner overlay in `draw_app_icons`. Entries are cleared
     /// when the app appears in `set_running_apps` or when their age
@@ -330,7 +330,7 @@ impl Drag {
             behaviour,
             fullscreen_workspaces: RefCell::new(HashSet::new()),
             pre_fullscreen: RefCell::new(HashMap::new()),
-            workspace_app_montages: RefCell::new(HashMap::new()),
+            workspace_views: RefCell::new(HashMap::new()),
             launching: RefCell::new(HashMap::new()),
             launching_started_at: Cell::new(None),
             launching_animation: RefCell::new(None),
@@ -434,7 +434,7 @@ impl Drag {
     pub fn set_opened_workspaces(&self, set: HashSet<WorkspaceId>) {
         // Deliberately NO queue_draw (slice 004 low-power): the rendered row
         // is the full grid and no longer depends on the opened set — only the
-        // montages do, and those arrive via `set_workspace_app_montages` with
+        // montages do, and those arrive via `set_workspace_views` with
         // their own change-gated redraw. The set is kept for app-launch
         // placement (`panel::first_free_workspace`), not for rendering.
         *self.opened_workspaces.borrow_mut() = set;
@@ -600,12 +600,12 @@ impl Drag {
         self.running.borrow().clone()
     }
 
-    /// Replace the per-workspace montage map. `queue_draw` only fires when
-    /// the projection actually changes — the subscriber already gates the
-    /// event, but a manual equality check keeps `set_workspace_app_montages`
+    /// Replace the per-workspace view-record map. `queue_draw` only fires
+    /// when the projection actually changes — the subscriber already gates
+    /// the event, but a manual equality check keeps `set_workspace_views`
     /// safe to call from anywhere without forcing a redraw.
-    pub fn set_workspace_app_montages(&self, map: HashMap<WorkspaceId, Vec<String>>) {
-        let mut slot = self.workspace_app_montages.borrow_mut();
+    pub fn set_workspace_views(&self, map: HashMap<WorkspaceId, Vec<MontageView>>) {
+        let mut slot = self.workspace_views.borrow_mut();
         if *slot == map {
             return;
         }
@@ -614,11 +614,12 @@ impl Drag {
         self.area.queue_draw();
     }
 
-    /// Ordered app-id list for `ws`, MRU-first, deduped. Empty when the
+    /// Ordered toplevel-view records for `ws` — one per open window,
+    /// stacking order bottom → top (topmost last). Empty when the
     /// workspace has no tracked toplevels — the renderer falls back to
     /// the bare-placeholder icon in that case.
-    pub fn workspace_app_montage(&self, ws: WorkspaceId) -> Vec<String> {
-        self.workspace_app_montages
+    pub fn workspace_views(&self, ws: WorkspaceId) -> Vec<MontageView> {
+        self.workspace_views
             .borrow()
             .get(&ws)
             .cloned()
@@ -804,8 +805,36 @@ impl Drag {
             .iter()
             .map(|w| format!(r#"{{"x":{},"y":{}}}"#, w.x, w.y))
             .collect();
+        // Per-workspace montage records (slice 005) — one record per open
+        // window with its workspace-local rect, assertable over IPC: two
+        // foot windows on one workspace must read back as two records with
+        // distinct rects, stacking order bottom → top. Sorted by workspace
+        // for determinism.
+        let mut montages: Vec<String> = self
+            .workspace_views
+            .borrow()
+            .iter()
+            .map(|(w, views)| {
+                let recs: Vec<String> = views
+                    .iter()
+                    .map(|mv| {
+                        format!(
+                            r#"{{"id":{},"app":"{}","rect":{{"x":{},"y":{},"w":{},"h":{}}}}}"#,
+                            mv.id,
+                            json_escape(&mv.app_id),
+                            mv.rect.x,
+                            mv.rect.y,
+                            mv.rect.w,
+                            mv.rect.h,
+                        )
+                    })
+                    .collect();
+                format!(r#"{{"x":{},"y":{},"views":[{}]}}"#, w.x, w.y, recs.join(","))
+            })
+            .collect();
+        montages.sort();
         format!(
-            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"rendered":[{}],"gestures":[{}],"planets":[{}],"sky":{}}}"#,
+            r#"{{"state":"{}","visual":{{"hidden":{:.3},"detailed":{:.3},"grid":{:.3}}},"surface":{{"w":{},"h":{}}},"workspace":{{"x":{},"y":{}}},"map":[{}],"rendered":[{}],"montages":[{}],"gestures":[{}],"planets":[{}],"sky":{}}}"#,
             self.state.get().as_str(),
             v.hidden_amount,
             v.detailed_amount,
@@ -816,6 +845,7 @@ impl Drag {
             ws.y,
             entries.join(","),
             rendered.join(","),
+            montages.join(","),
             gestures.join(","),
             planets.join(","),
             self.dump_sky(),

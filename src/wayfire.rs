@@ -64,6 +64,30 @@ pub fn log_status() {
     }
 }
 
+/// A toplevel view's geometry in **workspace-local** output coords — the
+/// view's rect on its own workspace (0..output_w, 0..output_h), independent
+/// of where that workspace sits relative to the focused one. Computed in
+/// `extract_view` as ints; the renderer (slice 006) owns normalising these
+/// to cell space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+/// One window's montage record: identity + workspace-local rect. Plain
+/// struct, no serde — it crosses only the in-process event channel.
+/// Ordered lists of these (per workspace, stacking order) are the payload
+/// of [`Event::WorkspaceViewsChanged`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MontageView {
+    pub id: i64,
+    pub app_id: String,
+    pub rect: ViewRect,
+}
+
 /// Events emitted by the subscriber thread to the GTK main loop.
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -93,12 +117,17 @@ pub enum Event {
     /// workspace enters this set, the daemon forces it to `Hidden`; when
     /// it leaves the set the prior state is restored.
     FullscreenWorkspacesChanged(HashSet<WorkspaceId>),
-    /// Per-workspace ordered list of app-ids backing the workspace icon
-    /// montage. Order is most-recently-focused first, deduped by app-id
-    /// (multiple firefox windows collapse to one slot). Workspaces with
-    /// no toplevel views are absent from the map; truncation to 4 +
-    /// "+N" overflow lives in the renderer.
-    WorkspaceAppMontagesChanged(HashMap<WorkspaceId, Vec<String>>),
+    /// Per-workspace ordered toplevel-view records backing the workspace
+    /// icon montage — **one record per window, no app-id dedupe** (slice
+    /// 005): two terminals on one workspace contribute two records. Empty
+    /// app-ids are kept — the cell renders a fallback glyph, never
+    /// nothing. Order is **stacking order, bottom → top** (topmost last),
+    /// empirically pinned against `list-views` on 2026-09-01 (a freshly
+    /// mapped + raised view lands at the end of the array), so slice 006
+    /// can paint bottom-to-top and let the topmost window win an overlap.
+    /// Workspaces with no toplevel views are absent from the map; the
+    /// interim 1/2/3/4-cell partition + `+N` badge lives in the renderer.
+    WorkspaceViewsChanged(HashMap<WorkspaceId, Vec<MontageView>>),
     /// Toplevel view just mapped. Carries id + app-id so the daemon can
     /// pair the new view with a pending action (e.g. terminal layout
     /// slot consumption). Fires for every toplevel map.
@@ -240,13 +269,25 @@ fn fetch_view_list() -> std::io::Result<Vec<Value>> {
 
 /// Per-view tracking info: the workspace the view's center sits on, plus
 /// its app-id (xdg-toplevel app_id, ideally matching a `.desktop` file
-/// stem). `app_id` may be empty for views that don't set one (some
-/// xwayland-bridged X clients).
+/// stem) and its workspace-local rect. `app_id` may be empty for views
+/// that don't set one (some xwayland-bridged X clients) — those are still
+/// tracked; the renderer falls back to a generic glyph.
 #[derive(Debug, Clone)]
 struct ViewInfo {
     workspace: WorkspaceId,
     app_id: String,
     fullscreen: bool,
+    rect: ViewRect,
+}
+
+/// Read a geometry object (`{x, y, width, height}`) from a JSON value.
+fn geometry_rect(geom: &Value) -> Option<ViewRect> {
+    Some(ViewRect {
+        x: geom.get("x")?.as_i64()? as i32,
+        y: geom.get("y")?.as_i64()? as i32,
+        w: geom.get("width")?.as_i64()? as i32,
+        h: geom.get("height")?.as_i64()? as i32,
+    })
 }
 
 /// Compute which workspace + app-id a view contributes to tracking. Returns
@@ -275,19 +316,28 @@ fn extract_view(
         return None;
     }
     let geom = view.get("geometry")?;
-    let vx = geom.get("x")?.as_i64()? as i32;
-    let vy = geom.get("y")?.as_i64()? as i32;
-    let vw = geom.get("width")?.as_i64()? as i32;
-    let vh = geom.get("height")?.as_i64()? as i32;
+    let g = geometry_rect(geom)?;
     let (ow, oh) = output_size;
     if ow <= 0 || oh <= 0 {
         return None;
     }
-    let cx = vx + vw / 2;
-    let cy = vy + vh / 2;
+    let cx = g.x + g.w / 2;
+    let cy = g.y + g.h / 2;
     let workspace = WorkspaceId {
         x: focused.x + cx.div_euclid(ow),
         y: focused.y + cy.div_euclid(oh),
+    };
+    // Wayfire reports geometry in focused-workspace-relative output coords.
+    // Workspace-local coords = geom − (ws − focused)·output_size per axis.
+    // Because `workspace` came from `div_euclid` over the same axis, the
+    // subtraction is exact and always lands in [0, output): focused (0,0),
+    // view on ws(1,0) at x=1285 → local x = 1285 − 1280 = 5; view one
+    // workspace LEFT at x=−1275 → ws(−1,0) → local x = −1275 + 1280 = 5.
+    let rect = ViewRect {
+        x: g.x - (workspace.x - focused.x) * ow,
+        y: g.y - (workspace.y - focused.y) * oh,
+        w: g.w,
+        h: g.h,
     };
     let app_id = view
         .get("app-id")
@@ -304,6 +354,7 @@ fn extract_view(
             workspace,
             app_id,
             fullscreen,
+            rect,
         },
     ))
 }
@@ -377,14 +428,19 @@ fn subscribe_once(tx: &async_channel::Sender<Event>) -> std::io::Result<()> {
     };
 
     let mut views_by_id: HashMap<i64, ViewInfo> = HashMap::new();
-    // Per-workspace most-recently-focused id list, head = MRU. Initial
-    // population from `list-views` is order-arbitrary — historical focus
-    // isn't queryable — so the first few `view-focused` events sort it.
-    let mut lru: HashMap<WorkspaceId, Vec<i64>> = HashMap::new();
+    // Per-workspace stacking order of tracked view ids, bottom → top
+    // (topmost LAST). Seeded from `list-views`, whose order was pinned
+    // empirically on 2026-09-01: within one workspace the topmost view
+    // comes later in the array — a freshly mapped + raised window landed
+    // at the end. Maintained by view-mapped (append on top), view-focused
+    // (move to top — Wayfire raises on focus), view-unmapped (remove
+    // anywhere), and view-workspace-changed (remove from old ws, push onto
+    // the new one).
+    let mut stack: HashMap<WorkspaceId, Vec<i64>> = HashMap::new();
     if let Ok(views) = fetch_view_list() {
         for v in views {
             if let Some((id, info)) = extract_view(&v, state.output_size, state.workspace) {
-                lru.entry(info.workspace).or_default().push(id);
+                stack.entry(info.workspace).or_default().push(id);
                 views_by_id.insert(id, info);
             }
         }
@@ -394,9 +450,9 @@ fn subscribe_once(tx: &async_channel::Sender<Event>) -> std::io::Result<()> {
     let _ = tx.send_blocking(Event::FullscreenWorkspacesChanged(fullscreen_set(
         &views_by_id,
     )));
-    let _ = tx.send_blocking(Event::WorkspaceAppMontagesChanged(montages_from(
+    let _ = tx.send_blocking(Event::WorkspaceViewsChanged(views_in_order(
         &views_by_id,
-        &lru,
+        &stack,
     )));
 
     loop {
@@ -404,7 +460,7 @@ fn subscribe_once(tx: &async_channel::Sender<Event>) -> std::io::Result<()> {
         let Some(name) = frame.get("event").and_then(|v| v.as_str()) else {
             continue;
         };
-        process_event(name, &frame, &mut state, &mut views_by_id, &mut lru, tx);
+        process_event(name, &frame, &mut state, &mut views_by_id, &mut stack, tx);
     }
 }
 
@@ -428,46 +484,51 @@ fn fullscreen_set(views_by_id: &HashMap<i64, ViewInfo>) -> HashSet<WorkspaceId> 
         .collect()
 }
 
-/// Project (views_by_id, per-workspace LRU) → per-workspace ordered app-id
-/// lists. Multiple views with the same app-id (two firefox windows on one
-/// ws) collapse to a single slot keyed by first MRU occurrence. Empty
-/// app-ids are filtered out — they can't match a .desktop entry. Untracked
-/// ids in the LRU (race with view-unmapped) are skipped.
-fn montages_from(
+/// Project (views_by_id, per-workspace stack) → per-workspace ordered
+/// `MontageView` lists. One record per tracked view — NO app-id dedupe
+/// (slice 005): two windows of the same app contribute two records, and an
+/// empty app-id still gets a record (the renderer draws a fallback glyph,
+/// never a blank cell). Order is stacking order bottom → top (topmost
+/// last). Untracked ids in the stack (race with view-unmapped) are
+/// skipped; workspaces that end up empty are omitted from the map.
+fn views_in_order(
     views_by_id: &HashMap<i64, ViewInfo>,
-    lru: &HashMap<WorkspaceId, Vec<i64>>,
-) -> HashMap<WorkspaceId, Vec<String>> {
-    let mut out: HashMap<WorkspaceId, Vec<String>> = HashMap::new();
-    for (ws, ids) in lru {
-        let mut apps: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+    stack: &HashMap<WorkspaceId, Vec<i64>>,
+) -> HashMap<WorkspaceId, Vec<MontageView>> {
+    let mut out: HashMap<WorkspaceId, Vec<MontageView>> = HashMap::new();
+    for (ws, ids) in stack {
+        let mut recs: Vec<MontageView> = Vec::with_capacity(ids.len());
         for id in ids {
             let Some(info) = views_by_id.get(id) else { continue };
-            if info.app_id.is_empty() {
-                continue;
-            }
-            if seen.insert(info.app_id.clone()) {
-                apps.push(info.app_id.clone());
-            }
+            recs.push(MontageView {
+                id: *id,
+                app_id: info.app_id.clone(),
+                rect: info.rect,
+            });
         }
-        if !apps.is_empty() {
-            out.insert(*ws, apps);
+        if !recs.is_empty() {
+            out.insert(*ws, recs);
         }
     }
     out
 }
 
 /// Emit OpenedWorkspacesChanged / RunningAppsChanged / FullscreenWorkspacesChanged
-/// / WorkspaceAppMontagesChanged only when the derived sets actually change —
+/// / WorkspaceViewsChanged only when the derived sets actually change —
 /// the whole map is recomputed cheap, and skipping no-op events keeps the
 /// GTK-side handler from re-rendering for nothing.
+///
+/// The WorkspaceViews comparison is the honest whole-projection equality:
+/// the payload now carries per-view geometry, so any rect change counts as
+/// a change here. Slice 007 owns coalescing; until then the cost is one
+/// small map rebuild per view event (tens of records), still negligible.
 fn emit_derived_if_changed(
     before_opened: &HashSet<WorkspaceId>,
     before_running: &HashSet<String>,
     before_fullscreen: &HashSet<WorkspaceId>,
-    before_montages: &HashMap<WorkspaceId, Vec<String>>,
+    before_views: &HashMap<WorkspaceId, Vec<MontageView>>,
     views_by_id: &HashMap<i64, ViewInfo>,
-    lru: &HashMap<WorkspaceId, Vec<i64>>,
+    stack: &HashMap<WorkspaceId, Vec<i64>>,
     tx: &async_channel::Sender<Event>,
 ) {
     let opened = opened_set(views_by_id);
@@ -482,28 +543,28 @@ fn emit_derived_if_changed(
     if fullscreen != *before_fullscreen {
         let _ = tx.send_blocking(Event::FullscreenWorkspacesChanged(fullscreen));
     }
-    let montages = montages_from(views_by_id, lru);
-    if montages != *before_montages {
-        let _ = tx.send_blocking(Event::WorkspaceAppMontagesChanged(montages));
+    let views = views_in_order(views_by_id, stack);
+    if views != *before_views {
+        let _ = tx.send_blocking(Event::WorkspaceViewsChanged(views));
     }
 }
 
-/// Move `id` to the head of `lru[ws]`, creating the entry if absent.
-/// Idempotent — re-prepending an existing id collapses to a single front
-/// position (the `retain` strips the old occurrence first).
-fn lru_promote(lru: &mut HashMap<WorkspaceId, Vec<i64>>, ws: WorkspaceId, id: i64) {
-    let entry = lru.entry(ws).or_default();
+/// Push `id` onto the top (end) of `stack[ws]` — stacking order, bottom →
+/// top. Idempotent-ish: re-pushing an id already in the list first removes
+/// the old occurrence, so a list never carries duplicates.
+fn stack_push_top(stack: &mut HashMap<WorkspaceId, Vec<i64>>, ws: WorkspaceId, id: i64) {
+    let entry = stack.entry(ws).or_default();
     entry.retain(|&x| x != id);
-    entry.insert(0, id);
+    entry.push(id);
 }
 
-/// Drop `id` from every workspace's LRU. view-unmapped is the only caller —
+/// Drop `id` from every workspace's stack. view-unmapped is the only caller —
 /// we don't trust the cached workspace (a race between an inter-workspace
 /// move and unmap could leave the old ws stale), so sweep all of them.
-/// Empty per-ws lists are pruned so `montages_from` doesn't carry ghost
+/// Empty per-ws lists are pruned so `views_in_order` doesn't carry ghost
 /// entries.
-fn lru_remove_anywhere(lru: &mut HashMap<WorkspaceId, Vec<i64>>, id: i64) {
-    lru.retain(|_, ids| {
+fn stack_remove_anywhere(stack: &mut HashMap<WorkspaceId, Vec<i64>>, id: i64) {
+    stack.retain(|_, ids| {
         ids.retain(|&x| x != id);
         !ids.is_empty()
     });
@@ -514,7 +575,7 @@ fn process_event(
     frame: &Value,
     state: &mut OutputState,
     views_by_id: &mut HashMap<i64, ViewInfo>,
-    lru: &mut HashMap<WorkspaceId, Vec<i64>>,
+    stack: &mut HashMap<WorkspaceId, Vec<i64>>,
     tx: &async_channel::Sender<Event>,
 ) {
     match name {
@@ -537,22 +598,24 @@ fn process_event(
             let before_opened = opened_set(views_by_id);
             let before_running = running_apps_set(views_by_id);
             let before_fullscreen = fullscreen_set(views_by_id);
-            let before_montages = montages_from(views_by_id, lru);
+            let before_views = views_in_order(views_by_id, stack);
             if let Some((id, info)) = extract_view(view, state.output_size, state.workspace) {
                 let app_id = info.app_id.clone();
                 let ws = info.workspace;
                 views_by_id.insert(id, info);
-                // A newly mapped view is implicitly focused; Wayfire follows
-                // with a `view-focused` shortly after, which would reaffirm
-                // this position. Prepending here covers the gap.
-                lru_promote(lru, ws, id);
+                // A newly mapped view goes on top of its workspace's stack
+                // (verified live 2026-09-01: the new window lands at the
+                // end of `list-views`). Wayfire follows with a
+                // `view-focused` shortly after, which reaffirms the same
+                // position via `stack_push_top`'s dedupe.
+                stack_push_top(stack, ws, id);
                 emit_derived_if_changed(
                     &before_opened,
                     &before_running,
                     &before_fullscreen,
-                    &before_montages,
+                    &before_views,
                     views_by_id,
-                    lru,
+                    stack,
                     tx,
                 );
                 let _ = tx.send_blocking(Event::ViewMapped { id, app_id });
@@ -564,16 +627,16 @@ fn process_event(
             let before_opened = opened_set(views_by_id);
             let before_running = running_apps_set(views_by_id);
             let before_fullscreen = fullscreen_set(views_by_id);
-            let before_montages = montages_from(views_by_id, lru);
+            let before_views = views_in_order(views_by_id, stack);
             if views_by_id.remove(&id).is_some() {
-                lru_remove_anywhere(lru, id);
+                stack_remove_anywhere(stack, id);
                 emit_derived_if_changed(
                     &before_opened,
                     &before_running,
                     &before_fullscreen,
-                    &before_montages,
+                    &before_views,
                     views_by_id,
-                    lru,
+                    stack,
                     tx,
                 );
             }
@@ -594,11 +657,13 @@ fn process_event(
                 }
             }
         }
-        // Focus change. Promotes the focused view to head of its workspace's
-        // LRU so the montage projection picks it up. Defensive on the
-        // payload shape: try `view.id` then a bare `id` field. If the id
-        // isn't tracked (the focused surface isn't a toplevel we care about
-        // — layer-shell client, sticky, etc.), drop silently.
+        // Focus change. Wayfire raises a view when it gains focus (the
+        // default focus policy), so a focused view is — or just became — the
+        // top of its workspace's stack: move it to the end of the list so
+        // the montage order tracks stacking. Defensive on the payload
+        // shape: try `view.id` then a bare `id` field. If the id isn't
+        // tracked (the focused surface isn't a toplevel we care about —
+        // layer-shell client, sticky, etc.), drop silently.
         "view-focused" => {
             let id_opt = frame
                 .get("view")
@@ -608,11 +673,11 @@ fn process_event(
             let Some(id) = id_opt else { return };
             let Some(info) = views_by_id.get(&id) else { return };
             let ws = info.workspace;
-            let before_montages = montages_from(views_by_id, lru);
-            lru_promote(lru, ws, id);
-            let after_montages = montages_from(views_by_id, lru);
-            if after_montages != before_montages {
-                let _ = tx.send_blocking(Event::WorkspaceAppMontagesChanged(after_montages));
+            let before_views = views_in_order(views_by_id, stack);
+            stack_push_top(stack, ws, id);
+            let after_views = views_in_order(views_by_id, stack);
+            if after_views != before_views {
+                let _ = tx.send_blocking(Event::WorkspaceViewsChanged(after_views));
             }
         }
         // Inter-workspace view move via super+shift+arrow. Wayfire emits this
@@ -641,12 +706,20 @@ fn process_event(
                 .get("fullscreen")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // The event's geometry is destination-relative (frame note
+            // above) and the destination IS the view's workspace, so the
+            // workspace-local rect is the reported geometry unchanged:
+            // local = geom − (ws − focused)·size with ws == focused == `to`.
+            let rect = view
+                .get("geometry")
+                .and_then(geometry_rect)
+                .unwrap_or(ViewRect { x: 0, y: 0, w: 0, h: 0 });
             let before_opened = opened_set(views_by_id);
             let before_running = running_apps_set(views_by_id);
             let before_fullscreen = fullscreen_set(views_by_id);
-            let before_montages = montages_from(views_by_id, lru);
+            let before_views = views_in_order(views_by_id, stack);
             // Read the source workspace BEFORE overwriting views_by_id so
-            // we know which LRU to evict from. Falls back to a full sweep
+            // we know which stack to evict from. Falls back to a full sweep
             // if the id isn't tracked (subscriber raced ahead of map).
             let old_ws = views_by_id.get(&id).map(|v| v.workspace);
             views_by_id.insert(
@@ -655,32 +728,215 @@ fn process_event(
                     workspace,
                     app_id,
                     fullscreen,
+                    rect,
                 },
             );
             match old_ws {
                 Some(old) if old != workspace => {
-                    if let Some(list) = lru.get_mut(&old) {
+                    if let Some(list) = stack.get_mut(&old) {
                         list.retain(|&x| x != id);
                     }
-                    lru.retain(|_, ids| !ids.is_empty());
+                    stack.retain(|_, ids| !ids.is_empty());
                 }
                 Some(_) => {}
-                None => lru_remove_anywhere(lru, id),
+                None => stack_remove_anywhere(stack, id),
             }
             // A super+shift+arrow move implies focus follows the view to
-            // the destination; promote to head so the destination's
-            // montage prepends it.
-            lru_promote(lru, workspace, id);
+            // the destination; push onto the top of the destination's stack.
+            stack_push_top(stack, workspace, id);
             emit_derived_if_changed(
                 &before_opened,
                 &before_running,
                 &before_fullscreen,
-                &before_montages,
+                &before_views,
                 views_by_id,
-                lru,
+                stack,
                 tx,
             );
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Screen 1280×853, grid 2×2, focused (0,0) — the live setup the
+    /// values were recorded against on 2026-09-01.
+    const OUT: (i32, i32) = (1280, 853);
+
+    fn view(id: i64, app: &str, x: i32, y: i32, w: i32, h: i32) -> Value {
+        json!({
+            "id": id,
+            "layer": "workspace",
+            "mapped": true,
+            "sticky": false,
+            "app-id": app,
+            "fullscreen": false,
+            "geometry": { "x": x, "y": y, "width": w, "height": h },
+        })
+    }
+
+    fn info(ws: WorkspaceId, app: &str, rect: ViewRect) -> ViewInfo {
+        ViewInfo {
+            workspace: ws,
+            app_id: app.to_owned(),
+            fullscreen: false,
+            rect,
+        }
+    }
+
+    // ---- slice 005: workspace assignment + workspace-local rect --------
+
+    #[test]
+    fn extract_view_live_focused_workspace_geometry_is_local() {
+        // Live: id=4 foot (5,5,629,843) and id=8 foot (644,5,631,843) sit
+        // on the focused ws(0,0) — their geometry IS their local rect.
+        let (_, i4) = extract_view(&view(4, "foot", 5, 5, 629, 843), OUT, WorkspaceId::ZERO)
+            .expect("id=4 tracked");
+        assert_eq!(i4.workspace, WorkspaceId { x: 0, y: 0 });
+        assert_eq!(i4.rect, ViewRect { x: 5, y: 5, w: 629, h: 843 });
+
+        let (_, i8) = extract_view(&view(8, "foot", 644, 5, 631, 843), OUT, WorkspaceId::ZERO)
+            .expect("id=8 tracked");
+        assert_eq!(i8.workspace, WorkspaceId { x: 0, y: 0 });
+        assert_eq!(i8.rect, ViewRect { x: 644, y: 5, w: 631, h: 843 });
+    }
+
+    #[test]
+    fn extract_view_live_neighbour_workspaces_become_local() {
+        // id=27 foot (1285,5,1270,843) → ws(1,0), local (5,5,1270,843).
+        let (_, i27) =
+            extract_view(&view(27, "foot", 1285, 5, 1270, 843), OUT, WorkspaceId::ZERO)
+                .expect("id=27 tracked");
+        assert_eq!(i27.workspace, WorkspaceId { x: 1, y: 0 });
+        assert_eq!(i27.rect, ViewRect { x: 5, y: 5, w: 1270, h: 843 });
+
+        // id=10 firefox (5,858,1270,843) → ws(0,1), local (5,5,1270,843).
+        let (_, i10) =
+            extract_view(&view(10, "firefox", 5, 858, 1270, 843), OUT, WorkspaceId::ZERO)
+                .expect("id=10 tracked");
+        assert_eq!(i10.workspace, WorkspaceId { x: 0, y: 1 });
+        assert_eq!(i10.rect, ViewRect { x: 5, y: 5, w: 1270, h: 843 });
+
+        // id=6 foot (1285,858,1270,843) → ws(1,1).
+        let (_, i6) =
+            extract_view(&view(6, "foot", 1285, 858, 1270, 843), OUT, WorkspaceId::ZERO)
+                .expect("id=6 tracked");
+        assert_eq!(i6.workspace, WorkspaceId { x: 1, y: 1 });
+        assert_eq!(i6.rect, ViewRect { x: 5, y: 5, w: 1270, h: 843 });
+    }
+
+    #[test]
+    fn extract_view_negative_offsets_wrap_within_the_output() {
+        // One workspace LEFT of focused: x=−1275 → ws(−1,0) via div_euclid
+        // (not truncation), local x = −1275 − (−1)·1280 = 5.
+        let (_, i) = extract_view(&view(9, "foot", -1275, 5, 1280, 843), OUT, WorkspaceId::ZERO)
+            .expect("left view tracked");
+        assert_eq!(i.workspace, WorkspaceId { x: -1, y: 0 });
+        assert_eq!(i.rect, ViewRect { x: 5, y: 5, w: 1280, h: 843 });
+    }
+
+    #[test]
+    fn extract_view_two_workspaces_away_localizes_against_focused() {
+        // Focused (2,0), view on ws(0,0) at x=−2560: local = −2560 − (0−2)·1280 = 0.
+        let focused = WorkspaceId { x: 2, y: 0 };
+        let (_, i) = extract_view(&view(11, "foot", -2560, 0, 1280, 853), OUT, focused)
+            .expect("two-left view tracked");
+        assert_eq!(i.workspace, WorkspaceId { x: 0, y: 0 });
+        assert_eq!(i.rect, ViewRect { x: 0, y: 0, w: 1280, h: 853 });
+    }
+
+    #[test]
+    fn extract_view_skips_non_workspace_layers_and_unmapped() {
+        let layer_shell = json!({
+            "id": 51, "layer": "top", "mapped": true, "sticky": false,
+            "geometry": { "x": 0, "y": 107, "width": 1280, "height": 746 },
+        });
+        assert!(extract_view(&layer_shell, OUT, WorkspaceId::ZERO).is_none());
+        let unmapped = json!({
+            "id": 52, "layer": "workspace", "mapped": false, "sticky": false,
+            "geometry": { "x": 0, "y": 0, "width": 10, "height": 10 },
+        });
+        assert!(extract_view(&unmapped, OUT, WorkspaceId::ZERO).is_none());
+    }
+
+    // ---- slice 005: one record per window, stacking order --------------
+
+    #[test]
+    fn views_in_order_keeps_duplicates_and_empty_app_ids() {
+        let ws = WorkspaceId::ZERO;
+        let mut by_id = HashMap::new();
+        by_id.insert(
+            4,
+            info(ws, "foot", ViewRect { x: 5, y: 5, w: 629, h: 843 }),
+        );
+        by_id.insert(
+            8,
+            info(ws, "foot", ViewRect { x: 644, y: 5, w: 631, h: 843 }),
+        );
+        by_id.insert(
+            9,
+            info(ws, "", ViewRect { x: 0, y: 0, w: 1280, h: 843 }),
+        );
+        // Stacking bottom → top: 4 (bottom), 9, 8 (topmost).
+        let stack = HashMap::from([(ws, vec![4, 9, 8])]);
+        let out = views_in_order(&by_id, &stack);
+        let recs = &out[&ws];
+        assert_eq!(recs.len(), 3, "no app-id dedupe, no empty-app-id drop");
+        assert_eq!(recs[0].id, 4);
+        assert_eq!(recs[1].id, 9);
+        assert_eq!(recs[2].id, 8);
+        assert_eq!(recs[1].app_id, "", "empty app-id kept, keyed by view id");
+        assert_eq!(recs[2].rect, ViewRect { x: 644, y: 5, w: 631, h: 843 });
+    }
+
+    #[test]
+    fn views_in_order_skips_untracked_ids_and_omits_empty_workspaces() {
+        let ws = WorkspaceId::ZERO;
+        let mut by_id = HashMap::new();
+        by_id.insert(
+            4,
+            info(ws, "foot", ViewRect { x: 0, y: 0, w: 10, h: 10 }),
+        );
+        // 99 raced ahead of view-mapped; the only tracked id is 4.
+        let stack = HashMap::from([(ws, vec![99, 4])]);
+        let out = views_in_order(&by_id, &stack);
+        assert_eq!(out[&ws].len(), 1);
+        assert_eq!(out[&ws][0].id, 4);
+
+        // A workspace whose ids all resolve to nothing is omitted entirely.
+        let stack = HashMap::from([
+            (ws, vec![98]),
+            (WorkspaceId { x: 1, y: 0 }, vec![97]),
+        ]);
+        assert!(views_in_order(&by_id, &stack).is_empty());
+    }
+
+    #[test]
+    fn stack_push_top_dedupes_and_moves_to_end() {
+        let ws = WorkspaceId::ZERO;
+        let mut stack = HashMap::from([(ws, vec![4, 9, 8])]);
+        // Re-push an existing id: moves to the top (end), no duplicate.
+        stack_push_top(&mut stack, ws, 9);
+        assert_eq!(stack[&ws], vec![4, 8, 9]);
+        // Fresh id: appended.
+        stack_push_top(&mut stack, ws, 12);
+        assert_eq!(stack[&ws], vec![4, 8, 9, 12]);
+    }
+
+    #[test]
+    fn stack_remove_anywhere_sweeps_all_workspaces() {
+        let ws_a = WorkspaceId { x: 0, y: 0 };
+        let ws_b = WorkspaceId { x: 1, y: 0 };
+        let mut stack = HashMap::from([(ws_a, vec![4, 9]), (ws_b, vec![8])]);
+        stack_remove_anywhere(&mut stack, 9);
+        assert_eq!(stack[&ws_a], vec![4]);
+        assert_eq!(stack[&ws_b], vec![8]);
+        // Removing the last id of a workspace prunes the entry.
+        stack_remove_anywhere(&mut stack, 8);
+        assert!(!stack.contains_key(&ws_b));
     }
 }

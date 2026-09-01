@@ -28,7 +28,7 @@ use crate::cpu::{self, CpuInfo};
 use crate::drag::{self, Direction, Drag, Visual};
 use crate::ipc;
 use crate::state::{BarState, WorkspaceId};
-use crate::wayfire::{self, GridSize};
+use crate::wayfire::{self, GridSize, MontageView};
 use crate::zones;
 
 const APP_ID: &str = "dev.unkownvee.SliverDock";
@@ -188,8 +188,8 @@ fn spawn_wayfire_subscriber(drag: &Rc<Drag>) {
                 wayfire::Event::FullscreenWorkspacesChanged(set) => {
                     drag.set_fullscreen_workspaces(set);
                 }
-                wayfire::Event::WorkspaceAppMontagesChanged(map) => {
-                    drag.set_workspace_app_montages(map);
+                wayfire::Event::WorkspaceViewsChanged(map) => {
+                    drag.set_workspace_views(map);
                 }
                 wayfire::Event::ViewMapped { id, app_id } => {
                     if app_id == terminal_app_id(drag.terminal())
@@ -803,9 +803,9 @@ fn draw_sections(
 
 /// Workspaces section content: row of rounded icons (one per rendered
 /// workspace), with the current workspace's icon brighter / heavier-bordered.
-/// Each icon's interior shows a per-workspace MRU app-icon montage
-/// (Milestone D); workspaces with no tracked toplevels fall back to the
-/// bare placeholder.
+/// Each icon's interior shows a per-window montage — one record per open
+/// window, no app-id dedupe (slice 005); workspaces with no tracked
+/// toplevels fall back to the bare placeholder.
 fn draw_workspace_icons(
     ctx: &CairoContext,
     drag: &Drag,
@@ -834,7 +834,7 @@ fn draw_workspace_icons(
 
     for (ws, rect) in &layout {
         let is_current = *ws == current;
-        let montage = drag.workspace_app_montage(*ws);
+        let montage = drag.workspace_views(*ws);
 
         rounded_rect_path(ctx, rect.x, rect.y, rect.w, rect.h, 7.0);
         let f_alpha = if is_current { 0.95 } else { 0.65 };
@@ -860,11 +860,19 @@ fn draw_workspace_icons(
 }
 
 /// Partition `rect` into 1/2/3/4 cells per the workspace-icon montage
-/// rules. Returns rects in MRU draw order:
+/// rules. Returns rects in display draw order:
 ///   * 1 — full rect.
-///   * 2 — vertical split, MRU on the left.
-///   * 3 — triangular: top-left = MRU, top-right = 2nd, bottom-full = 3rd.
+///   * 2 — vertical split, topmost on the left.
+///   * 3 — triangular: top-left = topmost, top-right = 2nd, bottom-full = 3rd.
 ///   * 4+ — 2×2 row-major; caller draws the `+N` badge separately when `n > 4`.
+///
+/// Overflow rule (slice 005): the minimum legible montage cell is a
+/// quarter-tile — the 41×41 icon letterboxed to the true screen aspect is
+/// ~41×27, and a quarter of that is ~20×13. Past 4 windows, shrink-to-fit
+/// would push cells below that floor, so the interim renderer keeps the
+/// 4-cell cap + a `+N` count badge (see [`draw_montage`]); slice 006's
+/// spatial layout gives every window its own natural cell and retires the
+/// badge entirely.
 ///
 /// `MONTAGE_GAP` (1 px) is the internal partition gap. Cells do not round
 /// — the outer rounded square owns the curvature.
@@ -924,24 +932,38 @@ fn montage_cells(rect: Rect, n: usize) -> Vec<Rect> {
     }
 }
 
-/// Paint the per-workspace app-icon montage inside `rect` (the outer 41×41
-/// rounded icon's interior bounds). Truncates `app_ids` to 4 cells; if more
-/// than 4 are supplied, a TN-purple `+N` badge is drawn at the bottom-right
-/// over the 4th cell.
+/// How many windows overflow the 4-cell interim partition — `None` when
+/// everything fits. Pure so the boundary (4 vs 5) is unit-testable; the
+/// badge itself is drawn by [`draw_overflow_badge`].
+fn montage_overflow(count: usize) -> Option<usize> {
+    (count > 4).then(|| count - 4)
+}
+
+/// Paint the per-workspace montage inside `rect` (the outer 41×41 rounded
+/// icon's interior bounds). One cell per window, no app-id dedupe (slice
+/// 005); records arrive in stacking order bottom → top, and are rendered
+/// REVERSED — topmost first — to match the display order slice 006 will
+/// turn into spatial placement. Truncates to 4 cells; if more than 4
+/// windows are open, a TN-purple `+N` badge is drawn at the bottom-right
+/// over the 4th cell (the interim overflow rule — see [`montage_cells`]).
 ///
 /// Each cell gets a 2-px-inset rounded bg (TN `bg_highlight`) so adjacent
 /// icons read as distinct against the outer rounded square's fill, then
 /// the cached icon surface scaled to fit (preserving aspect, centered).
 /// Icons load at `ICON_SIZE` to match the apps section's cache key — the
 /// surface gets reused across both sections without a size collision.
+/// A cell whose app-id can't be resolved (registry miss or empty app-id)
+/// draws a generic window glyph instead — a cell is never empty, and the
+/// negative cache in `app_icon_by_id` keeps the miss from retrying per
+/// frame.
 fn draw_montage(
     ctx: &CairoContext,
     rect: Rect,
-    app_ids: &[String],
+    views: &[MontageView],
     drag: &Drag,
     alpha: f64,
 ) {
-    let count = app_ids.len();
+    let count = views.len();
     if count == 0 {
         return;
     }
@@ -949,7 +971,8 @@ fn draw_montage(
     let bg_highlight = (0.161, 0.180, 0.259);
     let inset = 2.0;
     let cell_radius = 3.0;
-    for (i, cell) in cells.iter().enumerate() {
+    for (i, mv) in views.iter().rev().take(4).enumerate() {
+        let cell = cells[i];
         let icell = Rect {
             x: cell.x + inset,
             y: cell.y + inset,
@@ -960,32 +983,64 @@ fn draw_montage(
         ctx.set_source_rgba(bg_highlight.0, bg_highlight.1, bg_highlight.2, 0.95 * alpha);
         let _ = ctx.fill();
 
-        if let Some(surf) = drag.app_icon_by_id(&app_ids[i], ICON_SIZE as i32) {
-            let sw = surf.width() as f64;
-            let sh = surf.height() as f64;
-            if sw > 0.0 && sh > 0.0 {
-                let scale = (icell.w / sw).min(icell.h / sh);
-                let dx = icell.x + (icell.w - sw * scale) / 2.0;
-                let dy = icell.y + (icell.h - sh * scale) / 2.0;
-                ctx.save().ok();
-                ctx.translate(dx, dy);
-                if (scale - 1.0).abs() > 1e-3 {
-                    ctx.scale(scale, scale);
+        match drag.app_icon_by_id(&mv.app_id, ICON_SIZE as i32) {
+            Some(surf) => {
+                let sw = surf.width() as f64;
+                let sh = surf.height() as f64;
+                if sw > 0.0 && sh > 0.0 {
+                    let scale = (icell.w / sw).min(icell.h / sh);
+                    let dx = icell.x + (icell.w - sw * scale) / 2.0;
+                    let dy = icell.y + (icell.h - sh * scale) / 2.0;
+                    ctx.save().ok();
+                    ctx.translate(dx, dy);
+                    if (scale - 1.0).abs() > 1e-3 {
+                        ctx.scale(scale, scale);
+                    }
+                    let _ = ctx.set_source_surface(&surf, 0.0, 0.0);
+                    let _ = ctx.paint_with_alpha(alpha);
+                    ctx.restore().ok();
                 }
-                let _ = ctx.set_source_surface(&surf, 0.0, 0.0);
-                let _ = ctx.paint_with_alpha(alpha);
-                ctx.restore().ok();
             }
+            // A cell must never render empty (slice 005): unresolvable or
+            // empty app-id → generic window glyph.
+            None => draw_fallback_glyph(ctx, icell, alpha),
         }
     }
-    if count > 4 {
-        draw_overflow_badge(ctx, rect, count - 4, alpha);
+    if let Some(extra) = montage_overflow(count) {
+        draw_overflow_badge(ctx, rect, extra, alpha);
     }
+}
+
+/// Generic window glyph for a montage cell whose app-id can't be resolved
+/// to an icon — registry miss (an xwayland client with no `.desktop`
+/// entry) or an empty app-id. A rounded rect in Tokyo-Night fg at low
+/// alpha, with a hair-brighter top edge so it reads as a window rather
+/// than a failed background fill. No new asset, no text.
+fn draw_fallback_glyph(ctx: &CairoContext, cell: Rect, alpha: f64) {
+    let fg = (0.85, 0.88, 0.95);
+    let inset_x = (cell.w * 0.30).max(2.0);
+    let inset_y = (cell.h * 0.22).max(2.0);
+    let inner = Rect {
+        x: cell.x + inset_x,
+        y: cell.y + inset_y,
+        w: (cell.w - 2.0 * inset_x).max(2.0),
+        h: (cell.h - 2.0 * inset_y).max(2.0),
+    };
+    rounded_rect_path(ctx, inner.x, inner.y, inner.w, inner.h, 2.0);
+    ctx.set_source_rgba(fg.0, fg.1, fg.2, 0.28 * alpha);
+    let _ = ctx.fill();
+    ctx.set_source_rgba(fg.0, fg.1, fg.2, 0.5 * alpha);
+    ctx.set_line_width(1.0);
+    ctx.move_to(inner.x + 1.5, inner.y + 1.0);
+    ctx.line_to(inner.x + inner.w - 1.5, inner.y + 1.0);
+    let _ = ctx.stroke();
 }
 
 /// `+N` chip at the bottom-right of the outer icon rect. Sits *on top of*
 /// the 4th cell's icon — the spec deliberately overlays rather than
 /// replacing the 4th icon. TN purple body with TN-fg text + thin border.
+/// Interim overflow model (slice 005): with one record per window the
+/// badge counts *windows* now, and slice 006's spatial cells retire it.
 fn draw_overflow_badge(ctx: &CairoContext, rect: Rect, extra: usize, alpha: f64) {
     let badge_w = 16.0;
     let badge_h = 11.0;
@@ -2425,6 +2480,36 @@ mod tests {
         let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
         let cells = montage_cells(rect, 5);
         assert_eq!(cells.len(), 4);
+    }
+
+    // ---- slice 005: overflow boundary + fallback glyph -----------------
+
+    #[test]
+    fn montage_overflow_boundary_is_exactly_4_windows() {
+        // The interim rule: up to 4 windows fit the 1/2/3/4-cell partition;
+        // the 5th flips to the count badge. Slice 006 retires the badge
+        // with one spatial cell per window.
+        assert_eq!(montage_overflow(0), None);
+        assert_eq!(montage_overflow(1), None);
+        assert_eq!(montage_overflow(4), None);
+        assert_eq!(montage_overflow(5), Some(1));
+        assert_eq!(montage_overflow(6), Some(2));
+        assert_eq!(montage_overflow(12), Some(8));
+    }
+
+    #[test]
+    fn fallback_glyph_paints_pixels() {
+        // The "never a blank cell" contract: even a failed icon lookup must
+        // leave visible pixels in the cell.
+        let mut surface = cairo::ImageSurface::create(cairo::Format::A8, 40, 40).unwrap();
+        {
+            let ctx = CairoContext::new(&surface).unwrap();
+            draw_fallback_glyph(&ctx, Rect { x: 0.0, y: 0.0, w: 40.0, h: 40.0 }, 1.0);
+        }
+        let stride = surface.stride() as usize;
+        let data = surface.data().unwrap();
+        let painted = (0..40).any(|y| (0..40).any(|x| data[y * stride + x] > 0));
+        assert!(painted, "fallback glyph must paint pixels");
     }
 
     #[test]
