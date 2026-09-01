@@ -28,7 +28,7 @@ use crate::cpu::{self, CpuInfo};
 use crate::drag::{self, Direction, Drag, Visual};
 use crate::ipc;
 use crate::state::{BarState, WorkspaceId};
-use crate::wayfire::{self, GridSize, MontageView};
+use crate::wayfire::{self, GridSize, MontageView, ViewRect};
 use crate::zones;
 
 const APP_ID: &str = "dev.unkownvee.SliverDock";
@@ -803,9 +803,10 @@ fn draw_sections(
 
 /// Workspaces section content: row of rounded icons (one per rendered
 /// workspace), with the current workspace's icon brighter / heavier-bordered.
-/// Each icon's interior shows a per-window montage — one record per open
-/// window, no app-id dedupe (slice 005); workspaces with no tracked
-/// toplevels fall back to the bare placeholder.
+/// Each icon's interior shows a per-window **spatial** montage (slice 006) —
+/// one record per open window, no app-id dedupe, cells projected from the
+/// windows' workspace-local rects so the miniature mirrors the screen;
+/// workspaces with no tracked toplevels fall back to the bare placeholder.
 fn draw_workspace_icons(
     ctx: &CairoContext,
     drag: &Drag,
@@ -859,103 +860,117 @@ fn draw_workspace_icons(
     }
 }
 
-/// Partition `rect` into 1/2/3/4 cells per the workspace-icon montage
-/// rules. Returns rects in display draw order:
-///   * 1 — full rect.
-///   * 2 — vertical split, topmost on the left.
-///   * 3 — triangular: top-left = topmost, top-right = 2nd, bottom-full = 3rd.
-///   * 4+ — 2×2 row-major; caller draws the `+N` badge separately when `n > 4`.
+/// The letterboxed content box inside the 41×41 workspace icon: the largest
+/// rect with the **live screen's** aspect ratio, centred inside `icon`.
+/// With the 1280×853 output the box is ~41×27 centred vertically, so a
+/// half-width full-height window projects to a true vertical half (the
+/// locked user decision). The aspect comes from `output_size`, never a
+/// baked constant — this device rotates (`autorotate-iio`), so portrait
+/// must yield a tall narrow box, not a broken layout.
 ///
-/// Overflow rule (slice 005): the minimum legible montage cell is a
-/// quarter-tile — the 41×41 icon letterboxed to the true screen aspect is
-/// ~41×27, and a quarter of that is ~20×13. Past 4 windows, shrink-to-fit
-/// would push cells below that floor, so the interim renderer keeps the
-/// 4-cell cap + a `+N` count badge (see [`draw_montage`]); slice 006's
-/// spatial layout gives every window its own natural cell and retires the
-/// badge entirely.
-///
-/// `MONTAGE_GAP` (1 px) is the internal partition gap. Cells do not round
-/// — the outer rounded square owns the curvature.
-fn montage_cells(rect: Rect, n: usize) -> Vec<Rect> {
-    let g = MONTAGE_GAP;
-    match n {
-        0 => Vec::new(),
-        1 => vec![rect],
-        2 => {
-            let half_w = ((rect.w - g) / 2.0).max(1.0);
-            vec![
-                Rect { x: rect.x, y: rect.y, w: half_w, h: rect.h },
-                Rect {
-                    x: rect.x + half_w + g,
-                    y: rect.y,
-                    w: (rect.w - half_w - g).max(1.0),
-                    h: rect.h,
-                },
-            ]
-        }
-        3 => {
-            let half_w = ((rect.w - g) / 2.0).max(1.0);
-            let half_h = ((rect.h - g) / 2.0).max(1.0);
-            vec![
-                Rect { x: rect.x, y: rect.y, w: half_w, h: half_h },
-                Rect {
-                    x: rect.x + half_w + g,
-                    y: rect.y,
-                    w: (rect.w - half_w - g).max(1.0),
-                    h: half_h,
-                },
-                Rect {
-                    x: rect.x,
-                    y: rect.y + half_h + g,
-                    w: rect.w,
-                    h: (rect.h - half_h - g).max(1.0),
-                },
-            ]
-        }
-        _ => {
-            let half_w = ((rect.w - g) / 2.0).max(1.0);
-            let half_h = ((rect.h - g) / 2.0).max(1.0);
-            let right_w = (rect.w - half_w - g).max(1.0);
-            let bot_h = (rect.h - half_h - g).max(1.0);
-            vec![
-                Rect { x: rect.x, y: rect.y, w: half_w, h: half_h },
-                Rect { x: rect.x + half_w + g, y: rect.y, w: right_w, h: half_h },
-                Rect { x: rect.x, y: rect.y + half_h + g, w: half_w, h: bot_h },
-                Rect {
-                    x: rect.x + half_w + g,
-                    y: rect.y + half_h + g,
-                    w: right_w,
-                    h: bot_h,
-                },
-            ]
-        }
+/// `None` when the output size is unusable (≤ 0 on either axis) — the
+/// renderer then skips the montage rather than guessing a frame.
+fn content_box(icon: Rect, output_size: (i32, i32)) -> Option<Rect> {
+    let (ow, oh) = output_size;
+    if ow <= 0 || oh <= 0 {
+        return None;
+    }
+    let aspect = ow as f64 / oh as f64;
+    let icon_aspect = icon.w / icon.h;
+    if aspect > icon_aspect {
+        // Screen wider than the icon: fit to width, letterbox vertically.
+        let h = icon.w / aspect;
+        Some(Rect {
+            x: icon.x,
+            y: icon.y + (icon.h - h) / 2.0,
+            w: icon.w,
+            h,
+        })
+    } else {
+        // Screen taller than (or as wide as) the icon: fit to height,
+        // letterbox horizontally.
+        let w = icon.h * aspect;
+        Some(Rect {
+            x: icon.x + (icon.w - w) / 2.0,
+            y: icon.y,
+            w,
+            h: icon.h,
+        })
     }
 }
 
-/// How many windows overflow the 4-cell interim partition — `None` when
-/// everything fits. Pure so the boundary (4 vs 5) is unit-testable; the
-/// badge itself is drawn by [`draw_overflow_badge`].
-fn montage_overflow(count: usize) -> Option<usize> {
-    (count > 4).then(|| count - 4)
+/// Project one window's workspace-local rect into the letterboxed content
+/// box at the output's scale: `unit = local / output_size` per axis, then
+/// `content.origin + unit * content.size`. This is the heart of slice 006 —
+/// the miniature mirrors the screen, so it is pure and unit-tested over the
+/// real geometry values.
+///
+/// Clamps each axis to `[0,1]`: a view larger than the workspace
+/// (fullscreen with margins, or geometry briefly exceeding the output)
+/// stays inside the content box instead of overpainting its neighbours.
+/// Returns `None` (the cell is dropped, never NaN) for a zero-area or
+/// not-yet-sized rect, and for a rect fully off the output on either axis
+/// after clamping.
+fn project_view_cell(view: ViewRect, frame: (i32, i32), content: Rect) -> Option<Rect> {
+    let (fw, fh) = frame;
+    if fw <= 0 || fh <= 0 || view.w <= 0 || view.h <= 0 {
+        return None;
+    }
+    // f64 math throughout: coords arrive as i32 but `x + w` is computed in
+    // f64, so an extreme rect can never overflow.
+    let fw = fw as f64;
+    let fh = fh as f64;
+    let x1 = (view.x as f64 / fw).clamp(0.0, 1.0);
+    let y1 = (view.y as f64 / fh).clamp(0.0, 1.0);
+    let x2 = ((view.x as f64 + view.w as f64) / fw).clamp(0.0, 1.0);
+    let y2 = ((view.y as f64 + view.h as f64) / fh).clamp(0.0, 1.0);
+    if x2 <= x1 || y2 <= y1 {
+        return None;
+    }
+    Some(Rect {
+        x: content.x + x1 * content.w,
+        y: content.y + y1 * content.h,
+        w: (x2 - x1) * content.w,
+        h: (y2 - y1) * content.h,
+    })
+}
+
+/// Shrink a projected cell by `seam` on every side so adjacent cells keep a
+/// visible gutter: their true projection edges touch at the shared boundary,
+/// and two adjacent identical icons (the common case — terminals) would
+/// otherwise read as one. Never shrinks below 1×1.
+fn seam_cell(cell: Rect, seam: f64) -> Rect {
+    Rect {
+        x: cell.x + seam,
+        y: cell.y + seam,
+        w: (cell.w - 2.0 * seam).max(1.0),
+        h: (cell.h - 2.0 * seam).max(1.0),
+    }
 }
 
 /// Paint the per-workspace montage inside `rect` (the outer 41×41 rounded
-/// icon's interior bounds). One cell per window, no app-id dedupe (slice
-/// 005); records arrive in stacking order bottom → top, and are rendered
-/// REVERSED — topmost first — to match the display order slice 006 will
-/// turn into spatial placement. Truncates to 4 cells; if more than 4
-/// windows are open, a TN-purple `+N` badge is drawn at the bottom-right
-/// over the 4th cell (the interim overflow rule — see [`montage_cells`]).
+/// icon's interior bounds) as a **spatial miniature** (slice 006): each
+/// window's cell is its workspace-local rect projected into the letterboxed
+/// content box, so icon positions mirror on-screen positions — two
+/// side-by-side windows render side by side, a floating dialog lands on top
+/// of the window it overlaps. Records arrive in stacking order bottom →
+/// top and are painted in that order (topmost last), so an overlapping
+/// window's icon paints over the one below.
 ///
-/// Each cell gets a 2-px-inset rounded bg (TN `bg_highlight`) so adjacent
-/// icons read as distinct against the outer rounded square's fill, then
-/// the cached icon surface scaled to fit (preserving aspect, centered).
-/// Icons load at `ICON_SIZE` to match the apps section's cache key — the
-/// surface gets reused across both sections without a size collision.
-/// A cell whose app-id can't be resolved (registry miss or empty app-id)
-/// draws a generic window glyph instead — a cell is never empty, and the
-/// negative cache in `app_icon_by_id` keeps the miss from retrying per
-/// frame.
+/// Degenerate cases: no records → the caller already shows the bare
+/// placeholder; a record whose rect is zero-area, not-yet-sized, or fully
+/// off-screen is skipped (never NaN); a rect larger than the output is
+/// clamped to the content box; no `output_size` yet (pre-`Connected` or
+/// degraded mode — views can't arrive without it, so this is a defensive
+/// early-out, not a real mode) → the montage falls back to the bare
+/// placeholder too, rather than guessing a frame.
+///
+/// Each cell is shrunk by `CELL_SEAM` so adjacent identical icons keep a
+/// visible seam, then drawn exactly as before: a rounded bg (`bg_highlight`)
+/// inset 2 px, the cached icon scaled to fit (preserving aspect, centered),
+/// or the generic window glyph when the app-id can't be resolved (a cell is
+/// never empty). Icons still load at `ICON_SIZE` for the shared cache key —
+/// no second size.
 fn draw_montage(
     ctx: &CairoContext,
     rect: Rect,
@@ -963,16 +978,23 @@ fn draw_montage(
     drag: &Drag,
     alpha: f64,
 ) {
-    let count = views.len();
-    if count == 0 {
+    if views.is_empty() {
         return;
     }
-    let cells = montage_cells(rect, count.min(4));
+    let Some(frame) = drag.output_size() else {
+        return;
+    };
+    let Some(content) = content_box(rect, frame) else {
+        return;
+    };
     let bg_highlight = (0.161, 0.180, 0.259);
     let inset = 2.0;
     let cell_radius = 3.0;
-    for (i, mv) in views.iter().rev().take(4).enumerate() {
-        let cell = cells[i];
+    for mv in views {
+        let Some(cell) = project_view_cell(mv.rect, frame, content) else {
+            continue;
+        };
+        let cell = seam_cell(cell, CELL_SEAM);
         let icell = Rect {
             x: cell.x + inset,
             y: cell.y + inset,
@@ -1006,9 +1028,6 @@ fn draw_montage(
             None => draw_fallback_glyph(ctx, icell, alpha),
         }
     }
-    if let Some(extra) = montage_overflow(count) {
-        draw_overflow_badge(ctx, rect, extra, alpha);
-    }
 }
 
 /// Generic window glyph for a montage cell whose app-id can't be resolved
@@ -1034,46 +1053,6 @@ fn draw_fallback_glyph(ctx: &CairoContext, cell: Rect, alpha: f64) {
     ctx.move_to(inner.x + 1.5, inner.y + 1.0);
     ctx.line_to(inner.x + inner.w - 1.5, inner.y + 1.0);
     let _ = ctx.stroke();
-}
-
-/// `+N` chip at the bottom-right of the outer icon rect. Sits *on top of*
-/// the 4th cell's icon — the spec deliberately overlays rather than
-/// replacing the 4th icon. TN purple body with TN-fg text + thin border.
-/// Interim overflow model (slice 005): with one record per window the
-/// badge counts *windows* now, and slice 006's spatial cells retire it.
-fn draw_overflow_badge(ctx: &CairoContext, rect: Rect, extra: usize, alpha: f64) {
-    let badge_w = 16.0;
-    let badge_h = 11.0;
-    let inset = 1.0;
-    let badge_x = rect.x + rect.w - badge_w - inset;
-    let badge_y = rect.y + rect.h - badge_h - inset;
-
-    let purple = (0.733, 0.604, 0.969);
-    let fg = (0.85, 0.88, 0.95);
-
-    rounded_rect_path(ctx, badge_x, badge_y, badge_w, badge_h, 3.0);
-    ctx.set_source_rgba(purple.0, purple.1, purple.2, 0.95 * alpha);
-    let _ = ctx.fill_preserve();
-    ctx.set_source_rgba(fg.0, fg.1, fg.2, 0.4 * alpha);
-    ctx.set_line_width(1.0);
-    let _ = ctx.stroke();
-
-    let text = format!("+{}", extra);
-    ctx.save().ok();
-    ctx.select_font_face(
-        "Sans",
-        gtk4::cairo::FontSlant::Normal,
-        gtk4::cairo::FontWeight::Bold,
-    );
-    ctx.set_font_size(8.5);
-    if let Ok(ext) = ctx.text_extents(&text) {
-        let tx = badge_x + (badge_w - ext.width()) / 2.0 - ext.x_bearing();
-        let ty = badge_y + (badge_h - ext.height()) / 2.0 - ext.y_bearing();
-        ctx.set_source_rgba(fg.0, fg.1, fg.2, 0.95 * alpha);
-        ctx.move_to(tx, ty);
-        let _ = ctx.show_text(&text);
-    }
-    ctx.restore().ok();
 }
 
 /// Info section content. Top half: clock (`HH:MM` then `Day Nth`). Bottom
@@ -1390,8 +1369,13 @@ struct Rect {
 
 const ICON_SIZE: f64 = 41.0;
 const ICON_GAP: f64 = 8.0;
-/// Internal partition gap between montage cells inside a workspace icon.
-const MONTAGE_GAP: f64 = 1.0;
+/// Per-cell seam in the spatial montage (slice 006). The partition-era
+/// `MONTAGE_GAP` is gone with `montage_cells`; with real geometry the
+/// windows' own gutters are sub-pixel at 1/31 scale, so each projected
+/// cell shrinks by this fixed amount instead — two adjacent identical
+/// icons (terminals) keep a visible seam, and an overlapping window's
+/// edge stays readable.
+const CELL_SEAM: f64 = 1.0;
 
 /// Place up to `count` icons in a row inside the section. Centers the row
 /// horizontally and centers the `ICON_SIZE + extra_below` block vertically
@@ -2434,68 +2418,189 @@ mod tests {
     use crate::state::WorkspaceId;
     use std::collections::HashSet;
 
-    #[test]
-    fn montage_cells_0_empty() {
-        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        assert!(montage_cells(rect, 0).is_empty());
+    // ---- slice 006: spatial projection (content box + cell projection) ----
+
+    /// The real device geometry: icon 41×41, output 1280×853.
+    fn icon() -> Rect {
+        Rect { x: 0.0, y: 0.0, w: 41.0, h: 41.0 }
+    }
+
+    fn landscape() -> (i32, i32) {
+        (1280, 853)
+    }
+
+    fn portrait() -> (i32, i32) {
+        (853, 1280)
+    }
+
+    fn view(x: i32, y: i32, w: i32, h: i32) -> ViewRect {
+        ViewRect { x, y, w, h }
     }
 
     #[test]
-    fn montage_cells_1_full() {
-        let rect = Rect { x: 10.0, y: 20.0, w: 100.0, h: 100.0 };
-        let cells = montage_cells(rect, 1);
-        assert_eq!(cells.len(), 1);
-        assert!((cells[0].x - 10.0).abs() < 1e-9);
-        assert!((cells[0].y - 20.0).abs() < 1e-9);
-        assert!((cells[0].w - 100.0).abs() < 1e-9);
-        assert!((cells[0].h - 100.0).abs() < 1e-9);
+    fn content_box_landscape_letterboxes_vertically() {
+        // 1280×853 ≈ 1.5:1 inside the 41×41 icon → ~41×27.3 centred
+        // vertically: full width, bars top and bottom, no horizontal bars.
+        let boxed = content_box(icon(), landscape()).unwrap();
+        assert!((boxed.w - 41.0).abs() < 1e-9);
+        assert!((boxed.h - 27.32265625).abs() < 1e-6, "got h={}", boxed.h);
+        assert!((boxed.x - 0.0).abs() < 1e-9);
+        assert!(boxed.y > 0.0 && boxed.y < 41.0 - boxed.h);
+        // Centred vertically: equal bars above and below.
+        assert!((boxed.y - (41.0 - boxed.h - boxed.y)).abs() < 1e-9);
     }
 
     #[test]
-    fn montage_cells_2_vertical_split() {
-        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let cells = montage_cells(rect, 2);
-        assert_eq!(cells.len(), 2);
-        assert!(cells[0].x < cells[1].x);
-        assert_eq!(cells[0].h, cells[1].h);
+    fn content_box_portrait_tall_narrow() {
+        // 853×1280 (rotated) → the box flips: full height, narrow width,
+        // centred horizontally — not clipped, not squashed to landscape.
+        let boxed = content_box(icon(), portrait()).unwrap();
+        assert!((boxed.h - 41.0).abs() < 1e-9);
+        assert!((boxed.w - 27.32265625).abs() < 1e-6, "got w={}", boxed.w);
+        assert!((boxed.y - 0.0).abs() < 1e-9);
+        assert!((boxed.x - (41.0 - boxed.w - boxed.x)).abs() < 1e-9);
     }
 
     #[test]
-    fn montage_cells_3_triangular() {
-        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let cells = montage_cells(rect, 3);
-        assert_eq!(cells.len(), 3);
-        assert_eq!(cells[2].w, rect.w);
+    fn content_box_square_output_fills_icon() {
+        let boxed = content_box(icon(), (1000, 1000)).unwrap();
+        assert_eq!(boxed.w, 41.0);
+        assert_eq!(boxed.h, 41.0);
     }
 
     #[test]
-    fn montage_cells_4_grid() {
-        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let cells = montage_cells(rect, 4);
-        assert_eq!(cells.len(), 4);
+    fn content_box_bad_output_none() {
+        assert!(content_box(icon(), (0, 853)).is_none());
+        assert!(content_box(icon(), (1280, 0)).is_none());
+        assert!(content_box(icon(), (-1, 853)).is_none());
     }
 
     #[test]
-    fn montage_cells_5_truncated_to_4() {
-        let rect = Rect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
-        let cells = montage_cells(rect, 5);
-        assert_eq!(cells.len(), 4);
-    }
+    fn project_side_by_side_halves() {
+        // The live reference values (2026-09-01): two foot windows side by
+        // side, `(5,5,629,843)` and `(644,5,631,843)`.
+        let content = content_box(icon(), landscape()).unwrap();
+        let left = project_view_cell(view(5, 5, 629, 843), landscape(), content).unwrap();
+        let right = project_view_cell(view(644, 5, 631, 843), landscape(), content).unwrap();
 
-    // ---- slice 005: overflow boundary + fallback glyph -----------------
+        // Each ≈ half the content-box width, (almost) full height.
+        let half = content.w / 2.0;
+        assert!((left.w - half).abs() < 1.0, "left.w={}", left.w);
+        assert!((right.w - half).abs() < 1.0, "right.w={}", right.w);
+        assert!(left.h > content.h * 0.98);
+        assert!(right.h > content.h * 0.98);
+        // Left cell strictly left of the right cell; both inside the box.
+        assert!(left.x + left.w <= right.x + 1e-9);
+        assert!(left.x >= content.x - 1e-9);
+        assert!(right.x + right.w <= content.x + content.w + 1e-9);
+    }
 
     #[test]
-    fn montage_overflow_boundary_is_exactly_4_windows() {
-        // The interim rule: up to 4 windows fit the 1/2/3/4-cell partition;
-        // the 5th flips to the count badge. Slice 006 retires the badge
-        // with one spatial cell per window.
-        assert_eq!(montage_overflow(0), None);
-        assert_eq!(montage_overflow(1), None);
-        assert_eq!(montage_overflow(4), None);
-        assert_eq!(montage_overflow(5), Some(1));
-        assert_eq!(montage_overflow(6), Some(2));
-        assert_eq!(montage_overflow(12), Some(8));
+    fn project_three_terminal_figure() {
+        // The user's canonical figure: full-height half-width left; two
+        // stacked half-height half-width right. The vertical seam must sit
+        // at the content box's horizontal midpoint and the horizontal seam
+        // at its vertical midpoint, on the right half only.
+        let content = content_box(icon(), landscape()).unwrap();
+        let left = project_view_cell(view(0, 0, 640, 853), landscape(), content).unwrap();
+        let top = project_view_cell(view(640, 0, 640, 426), landscape(), content).unwrap();
+        let bottom = project_view_cell(view(640, 427, 640, 426), landscape(), content).unwrap();
+
+        let mid_x = content.x + content.w / 2.0;
+        let mid_y = content.y + content.h / 2.0;
+
+        // Left: full height at half width, ending exactly at the midline.
+        assert!((left.w - content.w / 2.0).abs() < 1e-9);
+        assert!((left.h - content.h).abs() < 1e-9);
+        assert!((left.x + left.w - mid_x).abs() < 1e-9);
+
+        // Right cells: each half width, half height, stacked.
+        for cell in [top, bottom] {
+            assert!((cell.w - content.w / 2.0).abs() < 1e-9);
+            assert!((cell.h - content.h / 2.0).abs() < 0.05, "cell.h={}", cell.h);
+            assert!((cell.x - mid_x).abs() < 1e-9);
+        }
+        // Top: from the box top down to the midline. Bottom: midline to box
+        // bottom. 427/853 is not exactly ½, so allow one px of slack.
+        assert!((top.y - content.y).abs() < 1e-9);
+        assert!((top.y + top.h - mid_y).abs() < 0.1);
+        assert!((bottom.y - mid_y).abs() < 0.1);
+        assert!((bottom.y + bottom.h - (content.y + content.h)).abs() < 1e-9);
     }
+
+    #[test]
+    fn project_single_window_fills_content() {
+        let content = content_box(icon(), landscape()).unwrap();
+        let cell = project_view_cell(view(0, 0, 1280, 853), landscape(), content).unwrap();
+        assert!((cell.x - content.x).abs() < 1e-9);
+        assert!((cell.y - content.y).abs() < 1e-9);
+        assert!((cell.w - content.w).abs() < 1e-9);
+        assert!((cell.h - content.h).abs() < 1e-9);
+    }
+
+    #[test]
+    fn project_portrait_fullscreen_fills_tall_box() {
+        // Rotated output: a fullscreen window fills the tall narrow box.
+        let content = content_box(icon(), portrait()).unwrap();
+        let cell = project_view_cell(view(0, 0, 853, 1280), portrait(), content).unwrap();
+        assert!((cell.x - content.x).abs() < 1e-9);
+        assert!((cell.y - content.y).abs() < 1e-9);
+        assert!((cell.w - content.w).abs() < 1e-9);
+        assert!((cell.h - content.h).abs() < 1e-9);
+    }
+
+    #[test]
+    fn project_clamps_oversized_view() {
+        // Fullscreen-with-margins (or a view briefly exceeding the output):
+        // the unit rect clamps to [0,1] — the cell is the whole content
+        // box, never larger.
+        let content = content_box(icon(), landscape()).unwrap();
+        let cell = project_view_cell(view(-100, -50, 1400, 1000), landscape(), content).unwrap();
+        assert!((cell.x - content.x).abs() < 1e-9);
+        assert!((cell.y - content.y).abs() < 1e-9);
+        assert!((cell.w - content.w).abs() < 1e-9);
+        assert!((cell.h - content.h).abs() < 1e-9);
+    }
+
+    #[test]
+    fn project_skips_zero_area_rects() {
+        let content = content_box(icon(), landscape()).unwrap();
+        assert!(project_view_cell(view(5, 5, 0, 100), landscape(), content).is_none());
+        assert!(project_view_cell(view(5, 5, 100, 0), landscape(), content).is_none());
+        // Negative w/h (malformed geometry) also skip — never NaN.
+        assert!(project_view_cell(view(5, 5, -3, 100), landscape(), content).is_none());
+    }
+
+    #[test]
+    fn project_skips_fully_off_frame_rects() {
+        let content = content_box(icon(), landscape()).unwrap();
+        // Fully to the right of the output.
+        assert!(project_view_cell(view(2000, 5, 100, 100), landscape(), content).is_none());
+        // Fully above the output (clamped to zero height).
+        assert!(project_view_cell(view(5, -200, 100, 100), landscape(), content).is_none());
+    }
+
+    #[test]
+    fn project_bad_frame_none() {
+        let content = content_box(icon(), landscape()).unwrap();
+        assert!(project_view_cell(view(0, 0, 100, 100), (0, 853), content).is_none());
+        assert!(project_view_cell(view(0, 0, 100, 100), (1280, 0), content).is_none());
+    }
+
+    #[test]
+    fn seam_cell_keeps_gutter_and_min_size() {
+        let cell = Rect { x: 10.0, y: 20.0, w: 20.0, h: 27.0 };
+        let seamed = seam_cell(cell, 1.0);
+        assert!((seamed.x - 11.0).abs() < 1e-9);
+        assert!((seamed.y - 21.0).abs() < 1e-9);
+        assert!((seamed.w - 18.0).abs() < 1e-9);
+        assert!((seamed.h - 25.0).abs() < 1e-9);
+        // A sub-seam cell shrinks to 1×1, never negative.
+        let tiny = seam_cell(Rect { x: 0.0, y: 0.0, w: 0.4, h: 3.0 }, 1.0);
+        assert!(tiny.w >= 1.0 && tiny.h >= 1.0);
+    }
+
+    // ---- slice 005: fallback glyph (kept — the cell render still uses it)
 
     #[test]
     fn fallback_glyph_paints_pixels() {
