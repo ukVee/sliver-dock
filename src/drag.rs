@@ -38,6 +38,9 @@ pub const BOTTOM_EDGE_ZONE_ID: &str = "sliver-dock.bottom-edge";
 pub const BAR_ZONE_ID: &str = "sliver-dock.bar-closed";
 pub const DETAILED_ZONE_ID: &str = "sliver-dock.detailed";
 pub const SLIVER_EDGE_ZONE_ID: &str = "sliver-dock.sliver-edge";
+/// The quick-launcher apps section zone — the narrow rect that must win
+/// over the broad detailed zone it sits inside (registration order).
+pub const APPS_ZONE_ID: &str = "sliver-dock.apps";
 
 /// Drop a tapped-but-unmapped app off the launching set after this long —
 /// safety net so a failed launch (no view ever maps) doesn't spin forever.
@@ -1063,16 +1066,8 @@ impl Drag {
 
     pub fn begin(self: &Rc<Self>, direction: Direction) {
         let source = self.state.get();
-        let target = match (source, direction) {
-            (BarState::Closed, Direction::Up) => BarState::Detailed,
-            (BarState::Closed, Direction::Down) => BarState::Hidden,
-            (BarState::Closed, Direction::UpGrid) => BarState::AppGrid,
-            (BarState::Detailed, Direction::Down) => BarState::Closed,
-            (BarState::Detailed, Direction::Up) => BarState::AppGrid,
-            (BarState::Detailed, Direction::UpGrid) => BarState::AppGrid,
-            (BarState::Hidden, Direction::Up) => BarState::Closed,
-            (BarState::AppGrid, Direction::Down) => BarState::Detailed,
-            _ => return,
+        let Some(target) = begin_target(source, direction) else {
+            return;
         };
         self.cancel_animation();
         self.session.set(Some(Session {
@@ -1171,6 +1166,30 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+/// The `(source state, gesture direction) → target state` routing table.
+/// Pure so the whole gesture contract is unit-testable; `begin` resolves
+/// through it and starts no session when it returns `None`.
+///
+/// Slice 002 removals, locked with the user 2026-09-01:
+///   * `(Closed, UpGrid) → AppGrid` — gone. Closed-up unambiguously means
+///     Detailed; reaching astro from Closed costs one extra swipe (up →
+///     Detailed, up again from the apps section or astro bar).
+///   * `(Detailed, Up) → AppGrid` — gone. No zone sends a plain `up` over
+///     Detailed any more: the broad detailed zone is unidir-down (up never
+///     commits) and the two astro-opening zones both send `up-grid`. Astro
+///     opens from the apps section or the astro sliver bar only.
+fn begin_target(source: BarState, direction: Direction) -> Option<BarState> {
+    match (source, direction) {
+        (BarState::Closed, Direction::Up) => Some(BarState::Detailed),
+        (BarState::Closed, Direction::Down) => Some(BarState::Hidden),
+        (BarState::Detailed, Direction::Down) => Some(BarState::Closed),
+        (BarState::Detailed, Direction::UpGrid) => Some(BarState::AppGrid),
+        (BarState::Hidden, Direction::Up) => Some(BarState::Closed),
+        (BarState::AppGrid, Direction::Down) => Some(BarState::Detailed),
+        _ => None,
+    }
+}
+
 /// The intended enabled-zone set per steady state — the single source of
 /// truth. (There used to be two hand-written copies of this logic, one here
 /// and one in `panel.rs`'s map callback; they drifted — both hardcoded the
@@ -1178,15 +1197,15 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
 /// Detailed swipe-down gesture. The map callback now calls
 /// [`update_zone_states`] instead of re-deriving the set.)
 ///
-///   * Closed   → bar zone (up opens Detailed, down hides)
+///   * Closed   → bar zone (up opens Detailed, down hides) + sliver-edge
+///     (down hides — unidir, see [`panel::sync_sliver_edge_zone`])
 ///   * Hidden   → bottom-edge zone (up unhides)
-///   * Detailed → detailed bidir zone (down anywhere closes to Closed;
-///     up arm reserved for the app-grid, refined by slice 002) +
-///     sliver-edge (up-grid opens AppGrid from the astro bar)
-///   * AppGrid  → detailed zone extended over the astro body (down anywhere
-///     returns to Detailed) + sliver-edge (down also closes; up-grid is a
-///     no-op from AppGrid)
-fn intended_zones(state: BarState) -> [(&'static str, bool); 4] {
+///   * Detailed → sliver-edge (up-grid opens AppGrid from the astro bar,
+///     down closes) + apps zone (up-grid opens AppGrid from the apps
+///     section, down closes) + broad detailed zone (unidir down closes)
+///   * AppGrid  → sliver-edge (unidir down closes) + detailed zone extended
+///     over the astro body (unidir down returns to Detailed)
+fn intended_zones(state: BarState) -> [(&'static str, bool); 5] {
     [
         (BAR_ZONE_ID, matches!(state, BarState::Closed)),
         (BOTTOM_EDGE_ZONE_ID, matches!(state, BarState::Hidden)),
@@ -1198,6 +1217,7 @@ fn intended_zones(state: BarState) -> [(&'static str, bool); 4] {
             SLIVER_EDGE_ZONE_ID,
             matches!(state, BarState::Closed | BarState::Detailed | BarState::AppGrid),
         ),
+        (APPS_ZONE_ID, matches!(state, BarState::Detailed)),
     ]
 }
 
@@ -1214,11 +1234,15 @@ pub(crate) fn zone_enabled(state: BarState, zone: &str) -> bool {
 /// Flip touch-drawer zones based on the steady state. At most the intended
 /// set per state is enabled — see [`intended_zones`] for the table.
 ///
-/// The two state-dependent zones (detailed + sliver-edge) also re-register
-/// their bounds on every state settle: the sliver-edge rides the detailed
-/// lift, and the detailed zone covers the astro body in AppGrid. Without
-/// this the swipe zones stayed pinned to the Closed geometry
-/// (`update_zone_bounds` only fires on map + monitor-change).
+/// The state-dependent zones (detailed + sliver-edge) re-register their
+/// bounds on every state settle: the sliver-edge rides the detailed lift,
+/// and the detailed zone covers the astro body in AppGrid. Without this
+/// the swipe zones stayed pinned to the Closed geometry
+/// (`update_zone_bounds` only fires on map + monitor-change). The
+/// sliver-edge's *arms* are state-dependent too — Closed/AppGrid keep only
+/// the down arm, Detailed carries the up-grid arm — so its registration is
+/// re-sent when the arm signature changes (see
+/// [`panel::sync_sliver_edge_zone`]).
 pub(crate) fn update_zone_states(state: BarState, geom: &Geometry) {
     for (id, enabled) in intended_zones(state) {
         zones::set_enabled(id, enabled);
@@ -1228,6 +1252,9 @@ pub(crate) fn update_zone_states(state: BarState, geom: &Geometry) {
         zones::update_bounds(DETAILED_ZONE_ID, x, y, w, h);
         let (x, y, w, h) = crate::panel::sliver_edge_zone_bounds(sw, sh, geom, state);
         zones::update_bounds(SLIVER_EDGE_ZONE_ID, x, y, w, h);
+        let (x, y, w, h) = crate::panel::apps_zone_bounds(sw, sh, geom);
+        zones::update_bounds(APPS_ZONE_ID, x, y, w, h);
+        crate::panel::sync_sliver_edge_zone(sw, sh, geom, state);
     }
 }
 
@@ -1327,6 +1354,7 @@ mod tests {
             BOTTOM_EDGE_ZONE_ID,
             DETAILED_ZONE_ID,
             SLIVER_EDGE_ZONE_ID,
+            APPS_ZONE_ID,
         ];
         let states = [
             BarState::Closed,
@@ -1346,9 +1374,10 @@ mod tests {
     fn closed_enables_only_bar_and_sliver_edge() {
         let s = BarState::Closed;
         assert!(zone_enabled(s, BAR_ZONE_ID));
-        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID));
+        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID), "down-only arm in Closed");
         assert!(!zone_enabled(s, BOTTOM_EDGE_ZONE_ID));
         assert!(!zone_enabled(s, DETAILED_ZONE_ID));
+        assert!(!zone_enabled(s, APPS_ZONE_ID));
     }
 
     #[test]
@@ -1358,13 +1387,15 @@ mod tests {
         assert!(!zone_enabled(s, BAR_ZONE_ID));
         assert!(!zone_enabled(s, DETAILED_ZONE_ID));
         assert!(!zone_enabled(s, SLIVER_EDGE_ZONE_ID));
+        assert!(!zone_enabled(s, APPS_ZONE_ID));
     }
 
     #[test]
-    fn detailed_enables_detailed_and_sliver_edge() {
+    fn detailed_enables_detailed_sliver_edge_and_apps() {
         let s = BarState::Detailed;
-        assert!(zone_enabled(s, DETAILED_ZONE_ID), "the revived zone");
-        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID));
+        assert!(zone_enabled(s, DETAILED_ZONE_ID), "the revived zone, down-only");
+        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID), "astro bar up-grid arm");
+        assert!(zone_enabled(s, APPS_ZONE_ID), "apps section up-grid arm");
         assert!(!zone_enabled(s, BAR_ZONE_ID));
         assert!(!zone_enabled(s, BOTTOM_EDGE_ZONE_ID));
     }
@@ -1373,14 +1404,52 @@ mod tests {
     fn app_grid_enables_detailed_and_sliver_edge() {
         let s = BarState::AppGrid;
         assert!(zone_enabled(s, DETAILED_ZONE_ID), "down-close zone");
-        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID));
+        assert!(zone_enabled(s, SLIVER_EDGE_ZONE_ID), "down-only close handle");
         assert!(!zone_enabled(s, BAR_ZONE_ID));
         assert!(!zone_enabled(s, BOTTOM_EDGE_ZONE_ID));
+        assert!(!zone_enabled(s, APPS_ZONE_ID), "no astro-opening zone in AppGrid");
     }
 
     #[test]
     fn unknown_zone_id_is_never_enabled() {
         assert!(!zone_enabled(BarState::Detailed, "sliver-dock.nope"));
+    }
+
+    // ---- slice 002: gesture routing table -----------------------------
+
+    #[test]
+    fn begin_target_closed_up_opens_detailed_never_grid() {
+        assert_eq!(begin_target(BarState::Closed, Direction::Up), Some(BarState::Detailed));
+        // The removed coin-flip arm: Closed-up-grid must not reach AppGrid.
+        assert_eq!(begin_target(BarState::Closed, Direction::UpGrid), None);
+    }
+
+    #[test]
+    fn begin_target_down_steps_one_state_back() {
+        assert_eq!(begin_target(BarState::Closed, Direction::Down), Some(BarState::Hidden));
+        assert_eq!(begin_target(BarState::Detailed, Direction::Down), Some(BarState::Closed));
+        assert_eq!(begin_target(BarState::AppGrid, Direction::Down), Some(BarState::Detailed));
+    }
+
+    #[test]
+    fn begin_target_astro_opens_from_detailed_only() {
+        // Astro opens from Detailed exclusively, via the two up-grid zones
+        // (apps section + astro sliver bar). No other arm reaches AppGrid.
+        assert_eq!(
+            begin_target(BarState::Detailed, Direction::UpGrid),
+            Some(BarState::AppGrid)
+        );
+        // The plain-up arm was removed: nothing sends `up` over Detailed any
+        // more, so a stray `up` must not open AppGrid from a random section.
+        assert_eq!(begin_target(BarState::Detailed, Direction::Up), None);
+        assert_eq!(begin_target(BarState::AppGrid, Direction::UpGrid), None);
+        assert_eq!(begin_target(BarState::Hidden, Direction::UpGrid), None);
+        assert_eq!(begin_target(BarState::Hidden, Direction::Down), None);
+    }
+
+    #[test]
+    fn begin_target_hidden_up_unhides_to_closed() {
+        assert_eq!(begin_target(BarState::Hidden, Direction::Up), Some(BarState::Closed));
     }
 
     #[test]

@@ -24,7 +24,9 @@ thread_local! {
 
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
-    #[allow(dead_code)] // protocol-complete; no unidir-down zone today
+    /// Unidir down — commits only on signed downward motion (`dy >=
+    /// commit_threshold`). Used by the broad detailed zone (the close
+    /// gesture) and by the sliver-edge zone in Closed/AppGrid (slice 002).
     Down,
     Up,
 }
@@ -51,12 +53,10 @@ fn send(line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn send_or_log(line: &str, op: &str) {
-    if let Err(e) = send(line) {
-        eprintln!("sliver-dock: zones {op}: {e}");
-    }
-}
-
+/// Register a unidirectional zone. Returns whether the write reached the
+/// plugin — callers that track a last-sent signature (like the
+/// sliver-edge re-register) must only record success, so a plugin that was
+/// down mid-flight gets the next settle re-sending and self-healing.
 #[allow(clippy::too_many_arguments)]
 pub fn register(
     id: &str,
@@ -69,7 +69,7 @@ pub fn register(
     begin_arg: &str,
     enabled: bool,
     travel_px: Option<i32>,
-) {
+) -> bool {
     let mut line = format!(
         "register {} {} {} {} {} {} {} {} {}",
         id,
@@ -86,12 +86,14 @@ pub fn register(
         line.push(' ');
         line.push_str(&t.to_string());
     }
-    send_or_log(&line, "register");
+    send_tracked(&line, "register")
 }
 
 /// Register a bidirectional zone — touch-drawer commits on either sign of
 /// Δy past `commit_threshold` and emits `drag-begin <begin_arg_up>` for
-/// upward motion or `drag-begin <begin_arg_down>` for downward.
+/// upward motion or `drag-begin <begin_arg_down>` for downward. Returns
+/// whether the write reached the plugin, same failure-aware contract as
+/// [`register`].
 ///
 /// `travel_px` overrides touch-drawer's default progress denominator
 /// (`screen_height / 3`). Pass the zone's own height for thin overlays so
@@ -108,7 +110,7 @@ pub fn register_bidir(
     begin_arg_down: &str,
     enabled: bool,
     travel_px: Option<i32>,
-) {
+) -> bool {
     let mut line = format!(
         "register {} {} {} {} {} bidir {} {} {} {}",
         id,
@@ -125,7 +127,7 @@ pub fn register_bidir(
         line.push(' ');
         line.push_str(&t.to_string());
     }
-    send_or_log(&line, "register-bidir");
+    send_tracked(&line, "register-bidir")
 }
 
 /// Send `line`, returning whether it reached the plugin. On failure the

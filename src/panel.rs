@@ -568,6 +568,54 @@ fn dock_stack_px(g: &Geometry) -> i32 {
     g.margin_bottom_px + g.default_height_px + g.detailed_content_height_px
 }
 
+/// The layer-shell window's height for a given screen height — the exact
+/// formula `build_window` sizes the surface with (primary path), so zone
+/// geometry and the real surface agree by construction instead of by
+/// coincidence. `grid_height_px` is the pre-grid fallback floor.
+fn window_height_px(sh: i32, g: &Geometry) -> i32 {
+    let d = dock_stack_px(g);
+    (sh - d).max(d + g.grid_height_px)
+}
+
+/// Convert a rectangle from **surface** coordinates (y = 0 at the surface
+/// top) to **screen** coordinates. The window is [`window_height_px`] tall
+/// and bottom-anchored, so `screen_y = sh - win_h + surface_y`; x is
+/// unchanged (the surface is full screen width).
+///
+/// This is the ONE conversion point for all zone geometry. Nothing
+/// re-derives screen offsets from `margin + default + detailed` constants —
+/// that is the exact bug fixed in
+/// `incident-20260801-app-grid-invisible-stale-surface-height`, where a
+/// constant-derived height pinned a region to the top of a
+/// taller-than-expected surface. Zone bounds derive from the same
+/// surface-anchored math as the draw path, then route through here.
+///
+/// Rounds outward (floor the origin, ceil the far edge) so a zone is
+/// always a superset of the painted rect it mirrors, never a sub-rect that
+/// strands touches in a sliver of unpainted-but-live surface.
+fn surface_rect_to_screen(sh: i32, g: &Geometry, x: f64, y: f64, w: f64, h: f64) -> (i32, i32, i32, i32) {
+    let win_h = window_height_px(sh, g);
+    let y_screen = y + (sh - win_h) as f64;
+    let sx = x.floor() as i32;
+    let sy = y_screen.floor() as i32;
+    let sw_z = (x + w).ceil() as i32 - sx;
+    let sh_z = (y_screen + h).ceil() as i32 - sy;
+    (sx, sy, sw_z, sh_z)
+}
+
+/// The fused sliver stack's top edge in **surface** coordinates for the
+/// given state (0 lift in Closed/Hidden, the detailed lift in Detailed —
+/// shared by the sliver-edge zone bounds and the draw path's
+/// `sliver_stack`). AppGrid never uses this: there the astro sliver has
+/// travelled to the astro rect's top border, handled separately.
+fn sliver_stack_top_surface(win_h: i32, g: &Geometry, state: BarState) -> f64 {
+    let lift = match state {
+        BarState::Detailed => g.detailed_content_height_px,
+        _ => 0,
+    };
+    win_h as f64 - g.margin_bottom_px as f64 - g.default_height_px as f64 * 3.0 - lift as f64
+}
+
 /// The astro-view rectangle in **surface** coordinates (`y = 0` at the surface
 /// top). It fills the whole surface above the dock's detailed stack, indented
 /// on each side to the sliver-tip x-extent (`tip_len = default_height · 6`).
@@ -1893,17 +1941,118 @@ pub(crate) fn current_screen_size() -> Option<(i32, i32)> {
     Some((geom.width(), geom.height()))
 }
 
+/// The sliver-edge zone's gesture arms per state — the zone is registered
+/// with different directions because its role changes with the state:
+///
+/// * `Closed` — **unidir down** (`down` → Hidden). The up-grid arm is
+///   dropped here: that was the `Closed → AppGrid` coin-flip the user
+///   locked out on 2026-09-01, and a unidir zone means an upward wiggle on
+///   the strip never even commits (touch-drawer's unidir commit test is
+///   signed, `dy >= need` for down), so the touch falls through instead of
+///   committing to a no-op and swallowing the gesture. The down arm must
+///   stay: "a downward swipe anywhere on any dock-owned surface steps one
+///   state back" includes the sliver strip in Closed, so disabling the
+///   zone outright would regress Hidden. No shadowing risk vs `BAR_ZONE`'s
+///   down arm — the two rects are disjoint in Closed (6px apart) and, even
+///   if they ever overlapped, both down arms map to the same
+///   `(Closed, Down) → Hidden` transition and `BAR_ZONE` registers first,
+///   so classify() would hand it the touch either way.
+/// * `Detailed` — **bidir** (`up-grid` → AppGrid from the astro bar,
+///   `down` → Closed). The only state that carries an up-grid arm.
+/// * `AppGrid` — **unidir down** (`down` → Detailed). The sliver is the
+///   astro view's close handle up at the top border; the up-grid arm is a
+///   no-op from AppGrid, so dropping it stops an upward wiggle being
+///   grabbed-and-swallowed for nothing.
+///
+/// `Hidden` is excluded from the table — the zone is disabled there, and
+/// its arms are irrelevant; a settle in Hidden leaves whatever arms were
+/// last registered in place, which the next Closed/Detailed/AppGrid settle
+/// corrects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SliverArms {
+    /// `register … down … "down"` — the down-only grab handle.
+    UnidirDown,
+    /// `register … bidir … "up-grid" "down"` — astro bar in Detailed.
+    BidirUpGridDown,
+}
+
+fn sliver_arms_for(state: BarState) -> SliverArms {
+    match state {
+        BarState::Detailed => SliverArms::BidirUpGridDown,
+        BarState::Closed | BarState::AppGrid | BarState::Hidden => SliverArms::UnidirDown,
+    }
+}
+
+thread_local! {
+    /// Last sliver-edge arm signature actually registered. Deliberately
+    /// failure-aware like `zones.rs`'s LAST_ENABLED/LAST_BOUNDS: recorded
+    /// only when the register write reached the plugin, so a plugin that
+    /// was down mid-flight gets re-registered on the next settle and
+    /// self-heals. Not seeded at boot — `register_zones` goes through the
+    /// same helper and records the seed on success.
+    static LAST_SLIVER_ARMS: std::cell::Cell<Option<SliverArms>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Register (or re-register) the sliver-edge zone with the arms its state
+/// demands — see [`SliverArms`]. Re-registration replaces the zone in
+/// place on the plugin side (touch-drawer's `upsert_zone`), so the
+/// registration-order position is preserved. Called from `register_zones`
+/// at boot and from `drag::update_zone_states` on every state settle;
+/// deduped on the arm signature so a settle that keeps the state's arms
+/// costs nothing.
+pub(crate) fn sync_sliver_edge_zone(sw: i32, sh: i32, geom: &Geometry, state: BarState) {
+    let arms = sliver_arms_for(state);
+    if LAST_SLIVER_ARMS.with(|c| c.get()) == Some(arms) {
+        return;
+    }
+    let (x, y, w, h) = sliver_edge_zone_bounds(sw, sh, geom, state);
+    let reply = ipc::socket_path();
+    let enabled = drag::zone_enabled(state, drag::SLIVER_EDGE_ZONE_ID);
+    let sent = match arms {
+        SliverArms::BidirUpGridDown => zones::register_bidir(
+            drag::SLIVER_EDGE_ZONE_ID,
+            x,
+            y,
+            w,
+            h,
+            &reply,
+            "up-grid",
+            "down",
+            enabled,
+            Some(h),
+        ),
+        SliverArms::UnidirDown => zones::register(
+            drag::SLIVER_EDGE_ZONE_ID,
+            x,
+            y,
+            w,
+            h,
+            zones::Direction::Down,
+            &reply,
+            "down",
+            enabled,
+            Some(h),
+        ),
+    };
+    if sent {
+        LAST_SLIVER_ARMS.with(|c| c.set(Some(arms)));
+    }
+}
+
 fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
     // Registration-order contract: touch-drawer's `classify()` linear-scans
     // the registry and returns the FIRST enabled zone whose rect contains
     // the touch-down point (touch-drawer/src/main.cpp:273). Overlapping
     // zones are therefore resolved by registration order — narrow/specific
     // zones must be registered BEFORE broad ones, or the specific gesture
-    // silently stops firing. Current shape: bottom-edge band and the
-    // sliver-edge strip (both narrow) before the bar zone (medium) and the
-    // detailed zone (broad — covers the whole dock surface, and the whole
-    // astro body in AppGrid). A future re-order changes gesture routing
-    // without a compile error, so edit this order deliberately.
+    // silently stops firing. Current shape, narrow → broad:
+    //   BOTTOM_EDGE → BAR_ZONE → SLIVER_EDGE → APPS → DETAILED.
+    // The apps zone (slice 002) sits INSIDE the broad detailed zone in
+    // Detailed, so it must precede it or up-swipes over the apps section
+    // would resolve to the broad down-only zone and never commit. A future
+    // re-order changes gesture routing without a compile error, so edit
+    // this order deliberately.
     let Some((sw, sh)) = current_screen_size() else {
         eprintln!("sliver-dock: no monitor 0; touch-drawer zones not registered");
         return;
@@ -1946,44 +2095,55 @@ fn register_zones(drag: &Rc<Drag>, geom: &Geometry) {
         Some(bh),
     );
 
-    // Sliver-edge bidir zone — 15px strip above the sliver bar. Up triggers
-    // the app-grid (UpGrid direction); down is a no-op in this zone. Uses
-    // travel_px=15 so a short swipe saturates progress. Enabled in Closed,
-    // Detailed, and AppGrid states.
+    // Sliver-edge zone — the astro sliver's grab target. Arms are
+    // state-dependent (see `sync_sliver_edge_zone` / `SliverArms`):
+    // bidir (up-grid → AppGrid / down → close) in Detailed, unidir down
+    // everywhere else. travel_px = zone height so a short swipe saturates
+    // progress. Registered through the same helper the settle path uses,
+    // so the dedupe seed and the re-register can never disagree.
     //
     // Registered BEFORE the detailed zone: in AppGrid the sliver-edge strip
     // sits inside the astro body covered by the (extended) detailed zone, so
     // narrow-first ordering keeps the strip's own routing authoritative.
-    let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom, initial);
+    sync_sliver_edge_zone(sw, sh, geom, initial);
+
+    // Apps-section zone (slice 002) — the quick-launcher apps section's
+    // rect in Detailed. Up-swipe over it opens the app-grid; down closes
+    // like anywhere else. Bidir; travel_px = zone height. Registered
+    // BEFORE the broad detailed zone so the up-grid arm wins inside the
+    // section (registration-order contract above).
+    let (ax, ay, aw, ah) = apps_zone_bounds(sw, sh, geom);
     zones::register_bidir(
-        drag::SLIVER_EDGE_ZONE_ID,
-        sx,
-        sy,
-        sw_z,
-        sh_z,
+        drag::APPS_ZONE_ID,
+        ax,
+        ay,
+        aw,
+        ah,
         &reply,
         "up-grid",
         "down",
-        drag::zone_enabled(initial, drag::SLIVER_EDGE_ZONE_ID),
-        Some(sh_z),
+        drag::zone_enabled(initial, drag::APPS_ZONE_ID),
+        Some(ah),
     );
 
-    // Detailed-view bidir zone — covers the full visible expanded window
+    // Detailed-view zone — covers the full visible expanded window
     // (bar + margin + detailed content) in Detailed, and the whole astro
     // body in AppGrid (state-dependent bounds, re-registered on every
-    // settle by `drag::update_zone_states`). Down resolves the close
-    // gesture (Detailed → Closed, AppGrid → Detailed); up is the app-grid
-    // arm, refined by slice 002. travel_px = zone height so the
-    // close-gesture progress maxes out within the visible window.
+    // settle by `drag::update_zone_states`). **Unidir down** (slice 002):
+    // the close gesture (Detailed → Closed, AppGrid → Detailed) is the
+    // only arm; up anywhere in the zone never commits at all, which is
+    // the locked no-op for up-swipes over the workspaces/info sections
+    // and the bar body. travel_px = zone height so the close-gesture
+    // progress maxes out within the visible window.
     let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, geom, initial);
-    zones::register_bidir(
+    zones::register(
         drag::DETAILED_ZONE_ID,
         dx,
         dy,
         dw,
         dh,
+        zones::Direction::Down,
         &reply,
-        "up",
         "down",
         drag::zone_enabled(initial, drag::DETAILED_ZONE_ID),
         Some(dh),
@@ -2003,21 +2163,29 @@ fn update_zone_bounds(geom: &Geometry, state: BarState) {
     zones::update_bounds(drag::BAR_ZONE_ID, bx, by, bw, bh);
     // Detailed + sliver-edge zones are state-dependent (the detailed zone
     // extends over the astro body in AppGrid; the sliver rides the detailed
-    // lift) — mirror the state passed in.
+    // lift) — mirror the state passed in. The apps zone's bounds are
+    // state-independent (the window is sized once) but re-derived here too,
+    // so a monitor change re-anchors everything in one place.
     let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, geom, state);
     zones::update_bounds(drag::DETAILED_ZONE_ID, dx, dy, dw, dh);
     let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, geom, state);
     zones::update_bounds(drag::SLIVER_EDGE_ZONE_ID, sx, sy, sw_z, sh_z);
+    let (ax, ay, aw, ah) = apps_zone_bounds(sw, sh, geom);
+    zones::update_bounds(drag::APPS_ZONE_ID, ax, ay, aw, ah);
 }
 
 /// Bar zone covers the bar plus the margin band beneath it, centered on
-/// the same horizontal extent as the visible spear.
+/// the same horizontal extent as the visible spear. Derived in surface
+/// coordinates (the bar is bottom-anchored at `win_h - margin`) and
+/// converted through [`surface_rect_to_screen`] — same anchor as the draw
+/// path, never a constant-derived screen offset.
 fn bar_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i32) {
     let bar_w = geom.width_px.min(sw);
-    let h = geom.margin_bottom_px + geom.default_height_px;
-    let x = (sw - bar_w) / 2;
-    let y = sh - h;
-    (x, y, bar_w, h)
+    let x = ((sw - bar_w) / 2) as f64;
+    let win_h = window_height_px(sh, geom);
+    let y_top = win_h as f64 - geom.margin_bottom_px as f64 - geom.default_height_px as f64;
+    let h = (geom.margin_bottom_px + geom.default_height_px) as f64;
+    surface_rect_to_screen(sh, geom, x, y_top, bar_w as f64, h)
 }
 
 /// Detailed zone covers the visible expanded window — bar + margin +
@@ -2025,10 +2193,11 @@ fn bar_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i32) {
 /// horizontal extent as the bar zone, taller.
 ///
 /// **State-dependent** (mirroring [`sliver_edge_zone_bounds`]): in
-/// `AppGrid` the surface is `screen_h - D` tall and the astro rect spans
-/// screen `[D, h-D]`, so the bottom-anchored dock-stack bounds would not
-/// reach the astro body at all. The zone extends to cover the whole astro
-/// body — that is the down-close gesture's target surface in AppGrid.
+/// `AppGrid` the zone covers the whole astro body — that is the
+/// down-close gesture's target surface in AppGrid, and the
+/// bottom-anchored dock-stack bounds would not reach a single pixel of
+/// it. Derived in surface coordinates (the astro rect spans the surface
+/// top to `win_h - D`) and converted through [`surface_rect_to_screen`].
 pub(crate) fn detailed_zone_bounds(
     sw: i32,
     sh: i32,
@@ -2036,17 +2205,21 @@ pub(crate) fn detailed_zone_bounds(
     state: BarState,
 ) -> (i32, i32, i32, i32) {
     let bar_w = geom.width_px.min(sw);
-    let x = (sw - bar_w) / 2;
+    let x = ((sw - bar_w) / 2) as f64;
 
     if matches!(state, BarState::AppGrid) {
-        // Astro body spans screen `[D, h-D]`; the zone covers exactly that.
+        // Astro body: surface `[0, win_h - D]` → screen `[D, h-D]`.
+        let win_h = window_height_px(sh, geom);
         let d = dock_stack_px(geom);
-        let h = (sh - 2 * d).max(0);
-        return (x, d, bar_w, h);
+        let h = (win_h - d).max(0) as f64;
+        return surface_rect_to_screen(sh, geom, x, 0.0, bar_w as f64, h);
     }
 
-    let h = geom.margin_bottom_px + geom.default_height_px + geom.detailed_content_height_px;
-    (x, sh - h, bar_w, h)
+    let win_h = window_height_px(sh, geom);
+    let h = (geom.margin_bottom_px + geom.default_height_px + geom.detailed_content_height_px)
+        as f64;
+    let y_top = win_h as f64 - h;
+    surface_rect_to_screen(sh, geom, x, y_top, bar_w as f64, h)
 }
 
 /// Sliver-edge zone — the astro sliver's grab target. Full bar width,
@@ -2062,7 +2235,8 @@ pub(crate) fn detailed_zone_bounds(
 ///   dock sliver left behind at the bottom (note 010 §Transition).
 ///
 /// Must be re-registered on every state settle (see `drag::update_zone_states`)
-/// — `update_zone_bounds` alone only fires on map + monitor-change.
+/// — `update_zone_bounds` alone only fires on map + monitor-change. The
+/// zone's *arms* are state-dependent as well; see [`sync_sliver_edge_zone`].
 pub(crate) fn sliver_edge_zone_bounds(
     sw: i32,
     sh: i32,
@@ -2070,32 +2244,59 @@ pub(crate) fn sliver_edge_zone_bounds(
     state: BarState,
 ) -> (i32, i32, i32, i32) {
     let bar_w = geom.width_px.min(sw);
-    let x = (sw - bar_w) / 2;
+    let x = ((sw - bar_w) / 2) as f64;
     const RUN_UP_PX: i32 = 15;
 
     if matches!(state, BarState::AppGrid) {
         // Astro rect top in screen coords = D. The sliver occupies its first
-        // `default_height_px`; the run-up band hangs below it, inside the view.
-        return (
+        // `default_height_px`; the run-up band hangs below it, inside the
+        // view. Surface-anchored: the sliver sits at the surface top.
+        return surface_rect_to_screen(
+            sh,
+            geom,
             x,
-            dock_stack_px(geom),
-            bar_w,
-            geom.default_height_px + RUN_UP_PX,
+            0.0,
+            bar_w as f64,
+            (geom.default_height_px + RUN_UP_PX) as f64,
         );
     }
 
-    let lift = match state {
-        BarState::Detailed => geom.detailed_content_height_px,
-        _ => 0,
-    };
     // Top of the fused pair = above the main bar, the dock sliver, and the
-    // astro sliver stacked on it.
-    let fused_top = sh - geom.margin_bottom_px - geom.default_height_px * 3 - lift;
-    (
+    // astro sliver stacked on it (surface coords; the lift only applies in
+    // Detailed — see `sliver_stack_top_surface`).
+    let win_h = window_height_px(sh, geom);
+    let fused_top = sliver_stack_top_surface(win_h, geom, state);
+    surface_rect_to_screen(
+        sh,
+        geom,
         x,
-        fused_top - RUN_UP_PX,
-        bar_w,
-        RUN_UP_PX + geom.default_height_px,
+        fused_top - RUN_UP_PX as f64,
+        bar_w as f64,
+        (RUN_UP_PX + geom.default_height_px) as f64,
+    )
+}
+
+/// Apps-section zone — the narrow rect that routes an up-swipe to the
+/// app-grid from inside the quick-launcher apps section in `Detailed`.
+/// Derived from [`section_bounds`] (surface coords): the section content
+/// extends **up** from `cut_y` by `detailed_content_height_px`, so the
+/// zone can never drift from what is painted. Converted to screen coords
+/// through [`surface_rect_to_screen`].
+///
+/// State-independent bounds: the window is sized once at startup and does
+/// not change with the bar state, and the zone is only *enabled* in
+/// `Detailed` (`drag::intended_zones`).
+pub(crate) fn apps_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, i32, i32) {
+    let win_h = window_height_px(sh, geom);
+    let layout = section_bounds(sw as f64, win_h as f64, geom);
+    let y_top = layout.cut_y - geom.detailed_content_height_px as f64;
+    surface_rect_to_screen(
+        sh,
+        geom,
+        layout.apps.0,
+        y_top,
+        layout.apps.1,
+        geom.detailed_content_height_px as f64,
     )
 }
 
@@ -2737,6 +2938,113 @@ mod tests {
         let zone = bar_zone_bounds(sw, sh, &g);
         let input = input_region_screen(sw, sh, &g, BarState::Closed);
         assert_eq!(zone, input, "Closed bar zone must match the client input region");
+    }
+
+    // ---- slice 002: apps-section zone + surface→screen conversion -----
+
+    #[test]
+    fn surface_rect_to_screen_anchors_to_the_real_window_height() {
+        let g = Geometry::default();
+        let d = dock_stack_px(&g);
+        // Normal path: the window is `screen_h - D` tall, so surface y = 0
+        // lands at screen y = D. x is unchanged.
+        let (x, y, w, h) = surface_rect_to_screen(853, &g, 190.0, 0.0, 900.0, 746.0);
+        assert_eq!((x, y, w, h), (190, d, 900, 746));
+        assert_eq!(window_height_px(853, &g), 853 - d);
+
+        // Grid-inflated fallback path (`build_window`'s `max`): a 600px
+        // screen keeps the pre-grid floor, so the window is TALLER than
+        // `screen_h - D`. The conversion must follow the real window
+        // height — the constant-derived alternative would pin surface y=0
+        // to screen y=D and strand every zone above the astro body, which
+        // is exactly the stale-surface-height incident.
+        let inflated = window_height_px(600, &g);
+        assert_eq!(inflated, d + g.grid_height_px, "floor path takes over");
+        assert!(inflated > 600 - d);
+        let (_, y, _, h) = surface_rect_to_screen(600, &g, 0.0, 0.0, 1280.0, inflated as f64);
+        assert_eq!(y, 600 - inflated, "top edge maps to the real window top");
+        assert_eq!(h, inflated, "full surface maps to full window height");
+    }
+
+    #[test]
+    fn apps_zone_matches_section_bounds_at_device_geometry() {
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        // Derive the expected rect independently: section_bounds in surface
+        // coords, converted by the same explicit arithmetic the helper
+        // implements — so the test mirrors the contract, not the fn.
+        let win_h = window_height_px(sh, &g);
+        let layout = section_bounds(sw as f64, win_h as f64, &g);
+        let y_top = layout.cut_y - g.detailed_content_height_px as f64;
+        let want = (
+            layout.apps.0 as i32,
+            (y_top + (sh - win_h) as f64) as i32,
+            layout.apps.1 as i32,
+            g.detailed_content_height_px,
+        );
+        assert_eq!(apps_zone_bounds(sw, sh, &g), want);
+        // Exact device values — a drift here (e.g. the section width
+        // formula changing without the zone following) is loud.
+        assert_eq!(apps_zone_bounds(sw, sh, &g), (604, 749, 408, 66));
+    }
+
+    #[test]
+    fn apps_zone_lands_inside_the_detailed_zone_and_outside_the_sliver() {
+        // Registration-order contract relies on the apps rect being strictly
+        // inside the broad detailed zone in Detailed, and disjoint from the
+        // sliver-edge strip (which is registered before both and must not
+        // shadow the apps section).
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 853);
+        let (ax, ay, aw, ah) = apps_zone_bounds(sw, sh, &g);
+        let (dx, dy, dw, dh) = detailed_zone_bounds(sw, sh, &g, BarState::Detailed);
+        assert!(ax >= dx && ay >= dy && ax + aw <= dx + dw && ay + ah <= dy + dh,
+            "apps zone must sit inside the broad detailed zone");
+        let (sx, sy, sw_z, sh_z) = sliver_edge_zone_bounds(sw, sh, &g, BarState::Detailed);
+        let disjoint = ay >= sy + sh_z || ay + ah <= sy || ax >= sx + sw_z || ax + aw <= sx;
+        assert!(disjoint, "apps zone must not overlap the sliver-edge strip");
+    }
+
+    #[test]
+    fn apps_zone_tracks_a_grid_inflated_window() {
+        // On a grid-inflated window the section content sits lower than the
+        // constant-derived position would put it; the zone must follow the
+        // real window height.
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 600);
+        let win_h = window_height_px(sh, &g);
+        assert_eq!(win_h, dock_stack_px(&g) + g.grid_height_px);
+        let layout = section_bounds(sw as f64, win_h as f64, &g);
+        let (_, ay, _, _) = apps_zone_bounds(sw, sh, &g);
+        let want_y = layout.cut_y - g.detailed_content_height_px as f64 + (sh - win_h) as f64;
+        assert!((ay as f64 - want_y).abs() < 1e-9);
+    }
+
+    #[test]
+    fn detailed_zone_app_grid_tracks_the_window_height() {
+        // AppGrid arm: the astro body is the surface above the dock stack,
+        // so at a grid-inflated screen the zone must still end exactly at
+        // the dock stack's top edge, not at a constant-derived line.
+        let g = Geometry::default();
+        let (sw, sh) = (1280, 600);
+        let win_h = window_height_px(sh, &g);
+        let d = dock_stack_px(&g);
+        let (x, y, w, h) = detailed_zone_bounds(sw, sh, &g, BarState::AppGrid);
+        assert_eq!(y, sh - win_h, "zone top = real window top");
+        assert_eq!(h, win_h - d, "astro body = window minus dock stack");
+        assert_eq!(y + h, sh - d, "zone bottom = dock stack top in screen coords");
+        assert_eq!(w, g.width_px);
+        assert_eq!(x, (sw - g.width_px) / 2);
+    }
+
+    #[test]
+    fn sliver_arms_follow_the_state() {
+        // Astro opens from Detailed only: the up-grid arm exists on the
+        // astro bar in Detailed, and nowhere else.
+        assert_eq!(sliver_arms_for(BarState::Detailed), SliverArms::BidirUpGridDown);
+        assert_eq!(sliver_arms_for(BarState::Closed), SliverArms::UnidirDown);
+        assert_eq!(sliver_arms_for(BarState::AppGrid), SliverArms::UnidirDown);
+        assert_eq!(sliver_arms_for(BarState::Hidden), SliverArms::UnidirDown);
     }
 }
 
