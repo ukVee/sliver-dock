@@ -158,7 +158,7 @@ pub enum Event {
     Disconnected,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GridSize {
     pub width: i32,
     pub height: i32,

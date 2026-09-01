@@ -24,7 +24,7 @@ use crate::astro;
 use crate::battery::{self, BatteryInfo, BatteryState};
 use crate::categories;
 use crate::config::{self, Animation, Geometry};
-use crate::cpu::{self, CpuInfo};
+use crate::cpu::CpuInfo;
 use crate::drag::{self, Direction, Drag, Visual};
 use crate::ipc;
 use crate::state::{BarState, WorkspaceId};
@@ -124,9 +124,10 @@ fn on_activate(app: &Application) {
     });
 
     watch_monitor_changes(Rc::clone(&drag), geom);
-    spawn_clock_tick(&area);
+    // The clock + CPU 1Hz timers are armed by `Drag` itself (slice 008),
+    // gated on the info section being on screen — no `spawn_clock_tick` /
+    // `cpu::spawn` calls here any more.
     battery::spawn(Rc::clone(&drag));
-    cpu::spawn(Rc::clone(&drag));
 
     let (tx, rx) = async_channel::unbounded::<ipc::Request>();
     if let Err(e) = ipc::serve(tx) {
@@ -1057,9 +1058,9 @@ fn draw_fallback_glyph(ctx: &CairoContext, cell: Rect, alpha: f64) {
 
 /// Info section content. Top half: clock (`HH:MM` then `Day Nth`). Bottom
 /// half: battery icon left, CPU icon right (CPU lands in 6c). The clock 1Hz
-/// `queue_draw` from `on_activate` covers redraws without battery events;
-/// battery PropertiesChanged events also call `queue_draw` via
-/// `Drag::set_battery`.
+/// `queue_draw` is armed by `Drag` only while the section is on screen
+/// (slice 008 — the dock idles at zero wakeups when Closed/Hidden); battery
+/// PropertiesChanged events also call `queue_draw` via `Drag::set_battery`.
 fn draw_info_section(
     ctx: &CairoContext,
     drag: &Drag,
@@ -2379,18 +2380,6 @@ pub(crate) fn apps_zone_bounds(sw: i32, sh: i32, geom: &Geometry) -> (i32, i32, 
         layout.apps.1,
         geom.detailed_content_height_px as f64,
     )
-}
-
-/// 1Hz redraw loop for the clock. Always running — `queue_draw` is cheap
-/// even when the section is hidden (Closed state's draw early-returns
-/// without painting the info content). Saves us from coupling the clock
-/// to state transitions.
-fn spawn_clock_tick(area: &DrawingArea) {
-    let area = area.clone();
-    glib::timeout_add_seconds_local(1, move || {
-        area.queue_draw();
-        glib::ControlFlow::Continue
-    });
 }
 
 fn watch_monitor_changes(drag: Rc<Drag>, geom: Geometry) {

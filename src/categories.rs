@@ -85,7 +85,7 @@ pub struct PlanetOverride {
 }
 
 /// One planet: a category and the apps that resolved to it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Planet {
     /// Category key — the grouping identity, and what `categories.toml`
     /// `[planet.<key>]` addresses.

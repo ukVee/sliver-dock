@@ -15,7 +15,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gtk4::cairo;
 use gtk4::glib;
@@ -93,6 +93,15 @@ pub struct Visual {
 /// `Hidden`, true from the first frame of an opening drag.
 pub fn workspaces_section_visible(v: Visual) -> bool {
     v.detailed_amount > 0.0
+}
+
+/// Milliseconds until the next wall-clock second boundary, given the
+/// sub-second part of the wall clock (`SystemTime::subsec_millis`, 0..=999).
+/// Pure so the clock's open-alignment (slice 008) is unit-testable: arming
+/// the first tick with this delay makes the new minute appear the instant it
+/// flips instead of up to a second late.
+pub(crate) fn delay_to_second_boundary_ms(subsec_millis: u32) -> u64 {
+    (1000 - subsec_millis % 1000) as u64
 }
 
 impl From<BarState> for Visual {
@@ -232,8 +241,8 @@ pub struct Drag {
     /// Latest UPower DisplayDevice snapshot. `None` until the first proxy
     /// reply lands, or if UPower isn't reachable. Read by `draw_info_section`.
     battery: Cell<Option<BatteryInfo>>,
-    /// Latest CPU usage sample (1Hz from `cpu::spawn`). `None` before the
-    /// second tick (the first records a baseline only).
+    /// Latest CPU usage sample (1Hz from the info-section-gated sampler).
+    /// `None` before the second tick (the first records a baseline only).
     cpu: Cell<Option<CpuInfo>>,
     /// Behaviour toggles from config (currently only `hide_when_fullscreen`
     /// is wired). Stored so the fullscreen-set handler can early-out
@@ -292,6 +301,16 @@ pub struct Drag {
     /// Whether the previous ambient step had a shooting star in flight, so
     /// the step after one lands can redraw once to clear it.
     astro_was_animating: Cell<bool>,
+    /// The info section's 1Hz clock redraw source, live only while the
+    /// section is on screen (slice 008). `Some` ⇔ a wakeup is armed.
+    clock_tick: RefCell<Option<glib::SourceId>>,
+    /// The info section's 1Hz CPU sampler source, gated exactly like
+    /// [`Self::clock_tick`].
+    cpu_tick: RefCell<Option<glib::SourceId>>,
+    /// Prior `/proc/stat` sample for the CPU delta. Persists across a
+    /// suspension so the sampler resumes on a fresh baseline — never on
+    /// time-since-boot accumulation.
+    cpu_prior: Cell<Option<crate::cpu::Sample>>,
     /// Start of the backdrop's own monotonic clock. Taken once at
     /// construction rather than at each open, so the sky keeps running while
     /// the launcher is closed and a meteor doesn't fire at the same beat
@@ -312,7 +331,7 @@ impl Drag {
         window: ApplicationWindow,
         area: DrawingArea,
     ) -> Rc<Self> {
-        Rc::new(Self {
+        let this = Rc::new(Self {
             geom,
             anim,
             terminal,
@@ -350,9 +369,19 @@ impl Drag {
             backdrop: RefCell::new(None),
             astro_animation: RefCell::new(None),
             astro_was_animating: Cell::new(false),
+            clock_tick: RefCell::new(None),
+            cpu_tick: RefCell::new(None),
+            cpu_prior: Cell::new(None),
             created_at: Instant::now(),
             gesture_ring: RefCell::new(VecDeque::new()),
-        })
+        });
+    // Boots in `Detailed` (below), so the info section is on screen from
+    // the first frame — arm the clock + CPU wakeups now, before the main
+    // loop runs. `set_visual` keeps them in step from here on; the
+    // idempotent start makes the double-arm harmless.
+    this.start_clock_tick();
+    this.start_cpu_sampler();
+    this
     }
 
     pub fn battery(&self) -> Option<BatteryInfo> {
@@ -428,6 +457,11 @@ impl Drag {
     }
 
     pub fn set_grid(&self, grid: GridSize) {
+        // Slice 008 audit: a wayfire reconnect reporting the same grid has
+        // nothing new to paint — skip the redraw.
+        if self.grid.get() == grid {
+            return;
+        }
         self.grid.set(grid);
         self.area.queue_draw();
     }
@@ -469,6 +503,12 @@ impl Drag {
     }
 
     pub fn set_planets(&self, planets: Vec<Planet>) {
+        // Change gate (slice 008 audit): identical roster → no cache drop,
+        // no redraw. Startup sets the roster once; the gate keeps a
+        // redundant re-set from clearing the laid-out sky for nothing.
+        if *self.planets.borrow() == planets {
+            return;
+        }
         *self.planets.borrow_mut() = planets;
         *self.sky.borrow_mut() = None;
         self.area.queue_draw();
@@ -566,6 +606,86 @@ impl Drag {
         }
     }
 
+    /// 1Hz clock redraw, live only while the info section is on screen.
+    /// Started and stopped from `set_visual`, so the clock follows drags,
+    /// snaps and workspace switches with no per-entry-point wiring.
+    ///
+    /// The first fire is aligned to the next wall-clock second boundary so
+    /// a fresh open shows the new minute the instant it flips, not up to a
+    /// second late (slice 008).
+    fn start_clock_tick(self: &Rc<Self>) {
+        if self.clock_tick.borrow().is_some() {
+            return;
+        }
+        let this = Rc::clone(self);
+        let area = self.area.clone();
+        let delay_ms = delay_to_second_boundary_ms(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_millis())
+                .unwrap_or(0),
+        );
+        let id = glib::timeout_add_local(Duration::from_millis(delay_ms), move || {
+            this.arm_clock_seconds(area.clone());
+            glib::ControlFlow::Break
+        });
+        *self.clock_tick.borrow_mut() = Some(id);
+    }
+
+    /// Continue the clock tick on the cheap 1s repeating source, storing the
+    /// new id over the one-shot's *before* it is dropped — the same "what's
+    /// stored is always live" contract as [`Self::arm_astro_frame`], so
+    /// `stop_clock_tick` never removes a dead id.
+    fn arm_clock_seconds(self: &Rc<Self>, area: DrawingArea) {
+        let id = glib::timeout_add_seconds_local(1, move || {
+            area.queue_draw();
+            glib::ControlFlow::Continue
+        });
+        *self.clock_tick.borrow_mut() = Some(id);
+    }
+
+    fn stop_clock_tick(&self) {
+        if let Some(id) = self.clock_tick.borrow_mut().take() {
+            id.remove();
+        }
+    }
+
+    /// 1Hz `/proc/stat` sampler, gated exactly like the clock. Suspended
+    /// while the dock is `Closed`/`Hidden`; on every (re)start the baseline
+    /// is taken immediately — the same trick `cpu::spawn` used at boot — so
+    /// the first emitted reading covers a real interval instead of the time
+    /// since the sampler last ran (slice 008).
+    fn start_cpu_sampler(self: &Rc<Self>) {
+        if self.cpu_tick.borrow().is_some() {
+            return;
+        }
+        if let Some(s) = crate::cpu::read_sample() {
+            self.cpu_prior.set(Some(s));
+        }
+        let this = Rc::clone(self);
+        let id = glib::timeout_add_seconds_local(1, move || {
+            let Some(now) = crate::cpu::read_sample() else {
+                return glib::ControlFlow::Continue;
+            };
+            let info = match this.cpu_prior.get() {
+                Some(prev) => CpuInfo {
+                    percent: crate::cpu::percent_between(prev, now),
+                },
+                None => CpuInfo { percent: 0 },
+            };
+            this.cpu_prior.set(Some(now));
+            this.set_cpu(info);
+            glib::ControlFlow::Continue
+        });
+        *self.cpu_tick.borrow_mut() = Some(id);
+    }
+
+    fn stop_cpu_sampler(&self) {
+        if let Some(id) = self.cpu_tick.borrow_mut().take() {
+            id.remove();
+        }
+    }
+
     /// The sky laid out for `rect`, solving it on first use and on any change
     /// of rect. Shared by the renderer, the tap handler and `get-state`, so
     /// all three read one layout rather than three that could drift.
@@ -589,6 +709,11 @@ impl Drag {
     }
 
     pub fn set_apps(&self, apps: Vec<AppEntry>) {
+        // Slice 008 audit: an identical roster reload has nothing new to
+        // paint and its icon cache is still valid — skip the redraw.
+        if *self.apps.borrow() == apps {
+            return;
+        }
         *self.apps.borrow_mut() = apps;
         self.icon_cache.borrow_mut().clear();
         self.area.queue_draw();
@@ -602,7 +727,13 @@ impl Drag {
             .borrow_mut()
             .retain(|id, _| !running.contains(id));
         *self.running.borrow_mut() = running;
-        self.area.queue_draw();
+        // Slice 008: the running set changes on app churn, not on a
+        // schedule, but a redraw of an invisible apps section is still
+        // waste when the dock is Closed. Data stays current; the next open
+        // repaints from it.
+        if workspaces_section_visible(self.visual()) {
+            self.area.queue_draw();
+        }
     }
 
     pub fn running_apps(&self) -> HashSet<String> {
@@ -928,6 +1059,19 @@ impl Drag {
             self.start_astro_animation();
         } else {
             self.stop_astro_animation();
+        }
+        // Slice 008: the 1Hz clock + CPU wakeups run only while the info
+        // section is on screen. `detailed_amount > 0` covers `Detailed`,
+        // `AppGrid` and every frame of an opening drag; `Closed` and
+        // `Hidden` idle at zero periodic wakeups. The start is idempotent
+        // and the stop leaves the stored data current, so a re-open paints
+        // the right clock and the CPU sampler re-baselines on resume.
+        if workspaces_section_visible(v) {
+            self.start_clock_tick();
+            self.start_cpu_sampler();
+        } else {
+            self.stop_clock_tick();
+            self.stop_cpu_sampler();
         }
         self.area.queue_draw();
     }
@@ -1496,6 +1640,22 @@ mod tests {
             detailed_amount: 0.01,
             grid_amount: 0.0,
         }));
+    }
+
+    // ---- slice 008: idle power budget (info-section-gated timers) ------
+
+    /// The clock's open-alignment delay always lands the first fire on the
+    /// next wall-clock second boundary.
+    #[test]
+    fn clock_first_fire_delay_hits_the_second_boundary() {
+        // Exactly on the boundary → a full second (never 0, which would
+        // busy-fire the one-shot).
+        assert_eq!(delay_to_second_boundary_ms(0), 1000);
+        assert_eq!(delay_to_second_boundary_ms(1), 999);
+        assert_eq!(delay_to_second_boundary_ms(500), 500);
+        assert_eq!(delay_to_second_boundary_ms(999), 1);
+        // Subsec can't exceed 999, but the modulo keeps any input in range.
+        assert_eq!(delay_to_second_boundary_ms(1000), 1000);
     }
 
     #[test]

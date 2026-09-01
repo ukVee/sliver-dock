@@ -1,25 +1,18 @@
-//! CPU usage from `/proc/stat` aggregate row.
+//! CPU usage from `/proc/stat` aggregate row — pure, timer-free.
 //!
-//! `spawn(Drag)` arms a 1Hz `glib::timeout_add_seconds_local` that reads
-//! `/proc/stat`, computes a delta against the prior tick, and pushes a
-//! `CpuInfo` to `Drag::set_cpu`. No external deps; the file is ~200 bytes
-//! and reading it once a second on a Surface Go 3 is negligible.
-//!
-//! The first tick has no prior sample, so it just records the baseline and
-//! pushes `0%`. Subsequent ticks emit real percentages.
-
-use std::cell::Cell;
-use std::rc::Rc;
-
-use gtk4::glib;
-
-use crate::drag::Drag;
+//! `Drag` owns the sampler's 1Hz `glib::timeout_add_seconds_local` lifecycle
+//! (slice 008: started/stopped from `set_visual` so no `/proc/stat` read
+//! happens while the info section is off screen). This module supplies the
+//! pure pieces it builds on: reading + parsing the aggregate row, the delta
+//! percentage, and the [`Sample`] baseline type. The first reading after a
+//! (re)start has no prior sample, so `Drag` records a fresh baseline and
+//! emits `0%`; subsequent ticks emit real percentages.
 
 /// Snapshot of `/proc/stat`'s `cpu` aggregate row, in jiffies. Fields after
 /// `softirq` are kernel ≥ 2.6.11 / 2.6.24 / 2.6.33 additions; we tolerate
 /// short rows by treating missing fields as zero.
-#[derive(Clone, Copy, Debug, Default)]
-struct Sample {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Sample {
     user: u64,
     nice: u64,
     system: u64,
@@ -54,32 +47,10 @@ pub struct CpuInfo {
     pub percent: u32,
 }
 
-pub fn spawn(drag: Rc<Drag>) {
-    let prior: Rc<Cell<Option<Sample>>> = Rc::new(Cell::new(None));
-
-    // Take the baseline immediately so the first emitted reading (1s later)
-    // covers a real interval rather than the time-since-boot accumulation.
-    if let Some(s) = read_sample() {
-        prior.set(Some(s));
-    }
-
-    glib::timeout_add_seconds_local(1, move || {
-        let Some(now) = read_sample() else {
-            return glib::ControlFlow::Continue;
-        };
-        let info = match prior.get() {
-            Some(prev) => CpuInfo {
-                percent: percent_between(prev, now),
-            },
-            None => CpuInfo { percent: 0 },
-        };
-        prior.set(Some(now));
-        drag.set_cpu(info);
-        glib::ControlFlow::Continue
-    });
-}
-
-fn read_sample() -> Option<Sample> {
+/// Read + parse the current `/proc/stat` aggregate row. `None` when the file
+/// is unreadable or its first line isn't the `cpu` aggregate — the sampler
+/// then skips this tick (the prior baseline stays put).
+pub(crate) fn read_sample() -> Option<Sample> {
     let text = std::fs::read_to_string("/proc/stat").ok()?;
     parse_aggregate(&text)
 }
@@ -103,7 +74,7 @@ fn parse_aggregate(text: &str) -> Option<Sample> {
     })
 }
 
-fn percent_between(prev: Sample, now: Sample) -> u32 {
+pub(crate) fn percent_between(prev: Sample, now: Sample) -> u32 {
     let total_d = now.total().saturating_sub(prev.total());
     if total_d == 0 {
         return 0;
