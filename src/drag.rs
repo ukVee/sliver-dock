@@ -222,7 +222,8 @@ pub struct Drag {
     /// Set of app-ids with at least one mapped toplevel view. Driven by
     /// the wayfire `RunningAppsChanged` event. Apps section filters out
     /// any entry whose id is in this set (v1-plan: "running apps disappear
-    /// from this section"). Empty until the first event arrives.
+    /// from this section") — except multi-instance entries, which stay
+    /// ([`Self::visible_apps`]). Empty until the first event arrives.
     running: RefCell<HashSet<String>>,
     /// Output pixel size of the focused output. Needed for terminal-layout
     /// geometry math (slot rectangles are computed as fractions of output
@@ -777,21 +778,25 @@ impl Drag {
     }
 
     /// Apps to render in the apps section: pinned-then-alphabetical (set
-    /// by `set_apps`) minus any whose id is currently running. Cloned so
+    /// by `set_apps`) minus any whose id is currently running. Multi-instance
+    /// entries (the terminal pin) are exempt from the running filter — they
+    /// stay in the row so every tap can spawn another window. Cloned so
     /// callers don't have to juggle two RefCell borrows simultaneously.
     pub fn visible_apps(&self) -> Vec<AppEntry> {
         let apps = self.apps.borrow();
         let running = self.running.borrow();
         apps.iter()
-            .filter(|e| !running.contains(&e.id))
+            .filter(|e| e.multi_instance || !running.contains(&e.id))
             .cloned()
             .collect()
     }
 
     /// Record that the user just tapped `id` to launch it. The spinner
     /// overlay shows in `draw_app_icons` for any id present in this map.
-    /// Cleared when the app appears in the running set (real success) or
-    /// when its age exceeds `LAUNCH_TIMEOUT_MS` (failed-launch safety net).
+    /// Cleared when the app appears in the running set (real success), when
+    /// its freshly mapped view arrives (repeat launches — see
+    /// [`Self::clear_launching`]), or when its age exceeds
+    /// `LAUNCH_TIMEOUT_MS` (failed-launch safety net).
     pub fn mark_launching(self: &Rc<Self>, id: &str) {
         let now = Instant::now();
         self.launching.borrow_mut().insert(id.to_owned(), now);
@@ -800,6 +805,15 @@ impl Drag {
         }
         self.start_launching_animation();
         self.area.queue_draw();
+    }
+
+    /// Clear `id`'s launch spinner, if any. Called when a view for the app
+    /// maps: a multi-instance entry never leaves the `running` set, so
+    /// `set_running_apps` cannot be the clear signal for a repeat launch.
+    pub fn clear_launching(&self, id: &str) {
+        if self.launching.borrow_mut().remove(id).is_some() {
+            self.area.queue_draw();
+        }
     }
 
     pub fn launching_ids(&self) -> HashSet<String> {

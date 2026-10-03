@@ -611,6 +611,7 @@ mod tests {
             exec: Some("/usr/bin/true".to_string()),
             no_display: false,
             hidden: false,
+            multi_instance: false,
             categories: Vec::new(),
         }
     }

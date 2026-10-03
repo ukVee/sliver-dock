@@ -4,7 +4,8 @@
 //!   * `.desktop` files under `/usr/share/applications` and
 //!     `~/.local/share/applications` (user dir overrides system).
 //!   * `~/.config/sliver-dock/apps.toml` — `pinned` (ordered), `hidden`
-//!     (filter-out), `overrides.<id>.{icon,display_name}`.
+//!     (filter-out), `multi_instance` (launch-behaviour flags),
+//!     `overrides.<id>.{icon,display_name}`.
 //!
 //! `build_visible` produces the final ordered list to render: pinned ids
 //! first (in declared order), then the remaining non-hidden + non-NoDisplay
@@ -35,6 +36,10 @@ pub struct AppEntry {
     pub exec: Option<String>,
     pub no_display: bool,
     pub hidden: bool,
+    /// App-id is in `apps.toml`'s `multi_instance` list: the icon stays in
+    /// the row while running, and every tap spawns one fresh instance in the
+    /// current workspace instead of switching to a free one or re-focusing.
+    pub multi_instance: bool,
     /// Raw `Categories=` list in declared order, empties dropped. Resolution
     /// to a single planet key lives in `categories.rs`.
     pub categories: Vec<String>,
@@ -45,6 +50,9 @@ pub struct AppEntry {
 pub struct AppsConfig {
     pub pinned: Vec<String>,
     pub hidden: Vec<String>,
+    /// App-ids that get the multi-instance launch behaviour (see
+    /// [`AppEntry::multi_instance`]). Order is irrelevant; membership only.
+    pub multi_instance: Vec<String>,
     pub overrides: BTreeMap<String, AppOverride>,
 }
 
@@ -157,6 +165,7 @@ fn parse_entry(id: &str, body: &str) -> Option<AppEntry> {
         exec,
         no_display,
         hidden,
+        multi_instance: false,
         categories,
     })
 }
@@ -295,7 +304,7 @@ pub fn build_visible(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) -> 
     let hidden: HashSet<&str> = cfg.hidden.iter().map(String::as_str).collect();
     let pinned_set: HashSet<&str> = cfg.pinned.iter().map(String::as_str).collect();
 
-    let apply_override = |e: AppEntry| -> AppEntry { apply_app_override(e, cfg) };
+    let apply_config = |e: AppEntry| -> AppEntry { apply_app_config(e, cfg) };
 
     let mut out: Vec<AppEntry> = Vec::new();
     for id in &cfg.pinned {
@@ -303,7 +312,7 @@ pub fn build_visible(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) -> 
             continue;
         }
         if let Some(e) = entries.get(id) {
-            out.push(apply_override(e.clone()));
+            out.push(apply_config(e.clone()));
         }
     }
     let mut rest: Vec<AppEntry> = entries
@@ -312,14 +321,15 @@ pub fn build_visible(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) -> 
         .filter(|e| !hidden.contains(e.id.as_str()))
         .filter(|e| !e.no_display && !e.hidden)
         .cloned()
-        .map(apply_override)
+        .map(apply_config)
         .collect();
     rest.sort_by_key(|a| a.name.to_lowercase());
     out.extend(rest);
     out
 }
 
-fn apply_app_override(mut e: AppEntry, cfg: &AppsConfig) -> AppEntry {
+fn apply_app_config(mut e: AppEntry, cfg: &AppsConfig) -> AppEntry {
+    e.multi_instance = cfg.multi_instance.contains(&e.id);
     if let Some(o) = cfg.overrides.get(&e.id) {
         if let Some(icon) = &o.icon {
             e.icon = Some(icon.clone());
@@ -350,7 +360,7 @@ pub fn build_launchable(entries: &BTreeMap<String, AppEntry>, cfg: &AppsConfig) 
         .values()
         .filter(|e| !e.no_display && !e.hidden)
         .cloned()
-        .map(|e| apply_app_override(e, cfg))
+        .map(|e| apply_app_config(e, cfg))
         .collect();
     out.sort_by(|a, b| {
         a.name
@@ -373,6 +383,7 @@ mod tests {
             exec: Some("/usr/bin/true".to_string()),
             no_display: false,
             hidden: false,
+            multi_instance: false,
             categories: Vec::new(),
         }
     }
@@ -522,6 +533,38 @@ mod tests {
         let visible = build_visible(&entries, &cfg);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, "a");
+    }
+
+    #[test]
+    fn build_visible_marks_multi_instance_apps() {
+        let mut entries = BTreeMap::new();
+        entries.insert("foot".to_string(), entry("foot", "Foot"));
+        entries.insert("a".to_string(), entry("a", "Alpha"));
+        let cfg = AppsConfig {
+            multi_instance: vec!["foot".to_string()],
+            ..Default::default()
+        };
+        let visible = build_visible(&entries, &cfg);
+        let flag = |id: &str| {
+            visible
+                .iter()
+                .find(|e| e.id == id)
+                .expect("entry present")
+                .multi_instance
+        };
+        assert!(flag("foot"));
+        assert!(!flag("a"));
+    }
+
+    #[test]
+    fn build_launchable_marks_multi_instance_apps() {
+        let mut entries = BTreeMap::new();
+        entries.insert("foot".to_string(), entry("foot", "Foot"));
+        let cfg = AppsConfig {
+            multi_instance: vec!["foot".to_string()],
+            ..Default::default()
+        };
+        assert!(build_launchable(&entries, &cfg)[0].multi_instance);
     }
 
     #[test]

@@ -193,6 +193,11 @@ fn spawn_wayfire_subscriber(drag: &Rc<Drag>) {
                     drag.set_workspace_views(map);
                 }
                 wayfire::Event::ViewMapped { id, app_id } => {
+                    // A mapped view is the real "launch finished" signal.
+                    // Multi-instance entries stay in the running set, so for a
+                    // repeat launch this is the only trace that clears their
+                    // spinner before the timeout expires.
+                    drag.clear_launching(&app_id);
                     if app_id == terminal_app_id(drag.terminal())
                         && let Some((x, y, w, h)) = drag.pop_terminal_slot()
                             && let Err(e) = wayfire::configure_view(id, x, y, w, h) {
@@ -1692,21 +1697,26 @@ fn install_section_click_handler(
 /// the child via the GLib mainloop child-watch). If no workspace is empty,
 /// stay put — Wayfire will map the new view onto the focused workspace.
 ///
-/// Terminal entry (id == basename of `cfg.terminal.command`) is special:
-/// instead of one process, we spawn `cfg.terminal.count`, queueing a
-/// per-process slot rectangle so each `view-mapped` event consumes one
-/// slot and lays the view out via `configure-view`. Re-tap re-focuses
-/// the saved terminal workspace if the terminal is still running.
+/// Multi-instance entries (the terminal pin) opt out of the placement
+/// entirely: every tap spawns one instance in the *current* workspace, with
+/// no workspace switch and no focus/reuse — see [`spawn_entry`].
+///
+/// Non-multi-instance terminal entries (id == basename of
+/// `cfg.terminal.command`) get the batch path: instead of one process, we
+/// spawn `cfg.terminal.count`, queueing a per-process slot rectangle so each
+/// `view-mapped` event consumes one slot and lays the view out via
+/// `configure-view`. Re-tap re-focuses the saved terminal workspace if the
+/// terminal is still running.
 fn handle_app_tap(drag: &Rc<Drag>, entry: &AppEntry) {
+    if entry.multi_instance {
+        spawn_entry(drag, entry);
+        return;
+    }
+
     if entry.id == terminal_app_id(drag.terminal()) {
         handle_terminal_tap(drag);
         return;
     }
-
-    let Some(exec) = entry.exec.as_deref() else {
-        eprintln!("sliver-dock: app {:?} has no Exec; nothing to launch", entry.id);
-        return;
-    };
 
     // `grid` is the full wayfire grid (1×1 in degraded mode); placement
     // logic only runs with a real output id, so the no-compositor path is
@@ -1725,12 +1735,23 @@ fn handle_app_tap(drag: &Rc<Drag>, entry: &AppEntry) {
                 }
     }
 
+    spawn_entry(drag, entry);
+}
+
+/// Spawn one process for `entry`'s `Exec` line and record the launch on
+/// success. Shared by the normal and multi-instance tap paths; the terminal
+/// batch path (`handle_terminal_tap`) runs its own spawn loop.
+fn spawn_entry(drag: &Rc<Drag>, entry: &AppEntry) {
+    let Some(exec) = entry.exec.as_deref() else {
+        eprintln!("sliver-dock: app {:?} has no Exec; nothing to launch", entry.id);
+        return;
+    };
     let cmdline = apps::strip_exec_field_codes(exec);
     match glib::spawn_command_line_async(&cmdline) {
-            Ok(()) => {
-                drag.mark_launching(&entry.id);
-                drag.increment_launch_count(&entry.id);
-            }
+        Ok(()) => {
+            drag.mark_launching(&entry.id);
+            drag.increment_launch_count(&entry.id);
+        }
         Err(e) => eprintln!("sliver-dock: spawn {cmdline:?}: {e}"),
     }
 }
@@ -2967,6 +2988,7 @@ mod tests {
                     exec: None,
                     no_display: false,
                     hidden: false,
+                    multi_instance: false,
                     categories: Vec::new(),
                 })
                 .collect(),
