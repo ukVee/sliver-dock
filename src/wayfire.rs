@@ -89,14 +89,14 @@ pub struct MontageView {
 }
 
 /// Icon-space quantisation resolution (slice 007). The workspace montage
-/// is drawn inside a `panel::ICON_SIZE` (41 px) square, and its letterboxed
+/// is drawn inside a `panel::ICON_SIZE` (45 px) square, and its letterboxed
 /// content box is at most that in either axis — so a geometry change
-/// smaller than 1/41 of the screen (~31 px at 1280 wide) can never move a
+/// smaller than 1/45 of the screen (~28 px at 1280 wide) can never move a
 /// cell edge by a whole icon pixel. Quantising the projection to this grid
 /// *before* the change comparison is what keeps an interactive drag-resize
 /// (hundreds of events, a few px apart) down to a handful of redraws.
 /// Pinned against `panel::ICON_SIZE` by a test there.
-pub const MONTAGE_QUANT_STEPS: i32 = 41;
+pub const MONTAGE_QUANT_STEPS: i32 = 45;
 
 /// One montage record reduced to what the icon can actually draw: identity
 /// plus the cell's edges in icon-space steps. Comparing these instead of
@@ -686,7 +686,7 @@ fn quantise_views(
 
 /// Idle gap that ends a geometry burst. Long enough that a retile's N
 /// back-to-back events coalesce into one update, short enough to be
-/// invisible in a 41 px miniature.
+/// invisible in the workspace miniature.
 const GEOMETRY_DEBOUNCE: Duration = Duration::from_millis(60);
 
 /// Hard cap on deferral. A continuous interactive resize never opens the
@@ -1435,10 +1435,10 @@ mod tests {
 
     #[test]
     fn quantise_rect_buckets_screen_px_into_icon_px() {
-        // 1280 wide over 41 icon px → one icon px ≈ 31.2 screen px.
-        let step = 1280 / MONTAGE_QUANT_STEPS; // 31
+        // 1280 wide over 45 icon px → one icon px ≈ 28.4 screen px.
+        let step = 1280 / MONTAGE_QUANT_STEPS; // 28
         let a = quantise_rect(ViewRect { x: 0, y: 0, w: 640, h: 853 }, OUT);
-        assert_eq!(a, (0, 0, 20, 41));
+        assert_eq!(a, (0, 0, 22, 45));
         // A move smaller than one icon px lands in the same bucket…
         let jitter = quantise_rect(
             ViewRect { x: step - 2, y: 0, w: 640, h: 853 },

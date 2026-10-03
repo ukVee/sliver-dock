@@ -35,10 +35,40 @@ const APP_ID: &str = "dev.unkownvee.SliverDock";
 
 const BOTTOM_EDGE_BAND_HEIGHT: i32 = 30;
 
-/// Width of the rightmost (info) section. Hardcoded both in `draw_sections`
-/// (for paint) and `section_bounds` (for click hit-test); centralize so a
-/// future bump only changes one number.
+/// Width of the rightmost (info) section. Part of the column split in
+/// [`section_columns`] — the single source of truth for paint, click
+/// hit-test, and the gesture-zone bounds; a future bump only changes one
+/// number.
 const INFO_SECTION_W: f64 = 72.0;
+
+/// Share of the bar's inner width (after the info section and the two
+/// `mid_gap`s) taken by the workspaces section; apps gets the rest. The
+/// split was even until 2026-10-03, when the apps roster reached nine pins
+/// and the even 408px column silently truncated the ninth (aerc). First
+/// rebalanced to a third, then eased to 35% the same day when the user asked
+/// for bigger icons and a roomier workspaces zone (`ICON_SIZE` 41 → 45). At
+/// device width this is 286px workspaces / 530px apps: the 2×2 row (204px)
+/// keeps ~41px of padding either side, and apps still fits ten icons —
+/// headroom above the current nine.
+const WORKSPACES_SPLIT: f64 = 0.35;
+
+/// Horizontal split of the bar into `(x, width)` columns:
+/// `[workspaces, apps, info]`. Shared by `draw_sections` (paint),
+/// [`section_bounds`] (click hit-test), and the gesture-zone bounds derived
+/// from it, so the four can't drift. Vertical placement is the caller's
+/// business: the draw path uses the animated cut line, the others the steady
+/// one.
+fn section_columns(bar_left: f64, bar_w: f64) -> [(f64, f64); 3] {
+    let mid_gap = 6.0;
+    let free_w = (bar_w - INFO_SECTION_W - 2.0 * mid_gap).max(0.0);
+    let ws_w = (free_w * WORKSPACES_SPLIT).round();
+    let apps_w = free_w - ws_w;
+    [
+        (bar_left, ws_w),
+        (bar_left + ws_w + mid_gap, apps_w),
+        (bar_left + bar_w - INFO_SECTION_W, INFO_SECTION_W),
+    ]
+}
 
 /// Radius and edge-pad of the bottom-row round icons (battery left, CPU right)
 /// inside the info section. Shared by the draw routines and the click
@@ -728,10 +758,11 @@ fn sky_rect(rect: &AstroRect) -> astro::SkyRect {
 
 /// Three placeholder section blocks staggered in detailed_amount space.
 /// Each section's clip-mask grows from 0 to `detailed_content_height_px`
-/// upward from `cut_y`. Layout (left → right):
-///   * Workspaces — extends to the left tip point.
-///   * Apps       — middle, fills whatever's between ws and info minus gaps.
-///   * Info       — 60×`max_h` rectangle anchored at the right tip point.
+/// upward from `cut_y`. Horizontal columns come from [`section_columns`]
+/// (`workspaces | apps | info`), so paint and hit-test share one split:
+///   * Workspaces — left, `WORKSPACES_SPLIT` of the free width.
+///   * Apps       — middle, the remaining 2/3.
+///   * Info       — `INFO_SECTION_W` wide, anchored at the right tip point.
 ///
 /// The gap between the trapezoid halves spans the full `bar_w` at both
 /// ends (each half's cut edge runs tip-to-tip), so the edge sections can
@@ -753,18 +784,7 @@ fn draw_sections(
     alpha: f64,
 ) {
     let max_h = g.detailed_content_height_px as f64;
-    let mid_gap = 6.0;
-    let main_w = ((bar_w - INFO_SECTION_W - 2.0 * mid_gap) / 2.0).max(0.0);
-
-    let ws_x = bar_left;
-    let apps_x = bar_left + main_w + mid_gap;
-    let info_x = bar_left + bar_w - INFO_SECTION_W;
-
-    let layout: [(f64, f64); 3] = [
-        (ws_x, main_w),
-        (apps_x, main_w),
-        (info_x, INFO_SECTION_W),
-    ];
+    let layout = section_columns(bar_left, bar_w);
 
     // Each section lags the previous by stagger_ms / snap_duration_ms in
     // detailed_amount space. detailed_amount itself is ease-out-cubic over
@@ -866,13 +886,14 @@ fn draw_workspace_icons(
     }
 }
 
-/// The letterboxed content box inside the 41×41 workspace icon: the largest
-/// rect with the **live screen's** aspect ratio, centred inside `icon`.
-/// With the 1280×853 output the box is ~41×27 centred vertically, so a
-/// half-width full-height window projects to a true vertical half (the
-/// locked user decision). The aspect comes from `output_size`, never a
-/// baked constant — this device rotates (`autorotate-iio`), so portrait
-/// must yield a tall narrow box, not a broken layout.
+/// The letterboxed content box inside the `ICON_SIZE`×`ICON_SIZE` workspace
+/// icon: the largest rect with the **live screen's** aspect ratio, centred
+/// inside `icon`. With the 1280×853 output the box is ~45×30 centred
+/// vertically, so a half-width full-height window projects to a true
+/// vertical half (the locked user decision). The aspect comes from
+/// `output_size`, never a baked constant — this device rotates
+/// (`autorotate-iio`), so portrait must yield a tall narrow box, not a
+/// broken layout.
 ///
 /// `None` when the output size is unusable (≤ 0 on either axis) — the
 /// renderer then skips the montage rather than guessing a frame.
@@ -954,14 +975,14 @@ fn seam_cell(cell: Rect, seam: f64) -> Rect {
     }
 }
 
-/// Paint the per-workspace montage inside `rect` (the outer 41×41 rounded
-/// icon's interior bounds) as a **spatial miniature** (slice 006): each
-/// window's cell is its workspace-local rect projected into the letterboxed
-/// content box, so icon positions mirror on-screen positions — two
-/// side-by-side windows render side by side, a floating dialog lands on top
-/// of the window it overlaps. Records arrive in stacking order bottom →
-/// top and are painted in that order (topmost last), so an overlapping
-/// window's icon paints over the one below.
+/// Paint the per-workspace montage inside `rect` (the outer
+/// `ICON_SIZE`×`ICON_SIZE` rounded icon's interior bounds) as a **spatial
+/// miniature** (slice 006): each window's cell is its workspace-local rect
+/// projected into the letterboxed content box, so icon positions mirror
+/// on-screen positions — two side-by-side windows render side by side, a
+/// floating dialog lands on top of the window it overlaps. Records arrive
+/// in stacking order bottom → top and are painted in that order (topmost
+/// last), so an overlapping window's icon paints over the one below.
 ///
 /// Degenerate cases: no records → the caller already shows the bare
 /// placeholder; a record whose rect is zero-area, not-yet-sized, or fully
@@ -1373,14 +1394,20 @@ struct Rect {
     h: f64,
 }
 
-const ICON_SIZE: f64 = 41.0;
+/// App-row and workspace-montage icon edge, in pixels. Raised 41 → 45 on
+/// 2026-10-03 at the user's request (bigger touch targets). Two couplings
+/// to respect when tuning: `wayfire.rs::MONTAGE_QUANT_STEPS` is pinned to
+/// this value by a test (the montage change-gate must resolve what the
+/// icon can draw), and the workspaces/apps column split in
+/// `WORKSPACES_SPLIT` is sized so a ten-icon apps row still fits.
+const ICON_SIZE: f64 = 45.0;
 const ICON_GAP: f64 = 8.0;
 /// Per-cell seam in the spatial montage (slice 006). The partition-era
 /// `MONTAGE_GAP` is gone with `montage_cells`; with real geometry the
-/// windows' own gutters are sub-pixel at 1/31 scale, so each projected
-/// cell shrinks by this fixed amount instead — two adjacent identical
-/// icons (terminals) keep a visible seam, and an overlapping window's
-/// edge stays readable.
+/// windows' own gutters are sub-pixel at the montage's scale, so each
+/// projected cell shrinks by this fixed amount instead — two adjacent
+/// identical icons (terminals) keep a visible seam, and an overlapping
+/// window's edge stays readable.
 const CELL_SEAM: f64 = 1.0;
 
 /// Place up to `count` icons in a row inside the section. Centers the row
@@ -1464,19 +1491,17 @@ struct SectionLayout {
 fn section_bounds(surface_w: f64, surface_h: f64, g: &Geometry) -> SectionLayout {
     let bar_w = (g.width_px as f64).min(surface_w);
     let bar_left = (surface_w - bar_w) / 2.0;
-    let mid_gap = 6.0;
-    let main_w = ((bar_w - INFO_SECTION_W - 2.0 * mid_gap) / 2.0).max(0.0);
+    let cols = section_columns(bar_left, bar_w);
     // `surface_h` is the real (grid-inflated) surface height; the bar is
     // bottom-anchored within it, so the cut line is measured up from the
     // bottom edge — never from a `margin+default+detailed` constant.
     let bar_bot_y = surface_h - g.margin_bottom_px as f64;
     let bar_top_y = bar_bot_y - g.default_height_px as f64;
     let cut_y = (bar_top_y + bar_bot_y) / 2.0;
-    let info_x = bar_left + bar_w - INFO_SECTION_W;
     SectionLayout {
-        ws: (bar_left, main_w),
-        apps: (bar_left + main_w + mid_gap, main_w),
-        info: (info_x, INFO_SECTION_W),
+        ws: cols[0],
+        apps: cols[1],
+        info: cols[2],
         cut_y,
     }
 }
@@ -2430,9 +2455,9 @@ mod tests {
 
     // ---- slice 006: spatial projection (content box + cell projection) ----
 
-    /// The real device geometry: icon 41×41, output 1280×853.
+    /// The real device geometry: icon sized to `ICON_SIZE`, output 1280×853.
     fn icon() -> Rect {
-        Rect { x: 0.0, y: 0.0, w: 41.0, h: 41.0 }
+        Rect { x: 0.0, y: 0.0, w: ICON_SIZE, h: ICON_SIZE }
     }
 
     fn landscape() -> (i32, i32) {
@@ -2459,15 +2484,17 @@ mod tests {
 
     #[test]
     fn content_box_landscape_letterboxes_vertically() {
-        // 1280×853 ≈ 1.5:1 inside the 41×41 icon → ~41×27.3 centred
-        // vertically: full width, bars top and bottom, no horizontal bars.
+        // 1280×853 ≈ 1.5:1 inside the square icon → full width, a
+        // ICON_SIZE × 853/1280 letterbox centred vertically: bars top and
+        // bottom, no horizontal bars.
         let boxed = content_box(icon(), landscape()).unwrap();
-        assert!((boxed.w - 41.0).abs() < 1e-9);
-        assert!((boxed.h - 27.32265625).abs() < 1e-6, "got h={}", boxed.h);
+        let want_h = ICON_SIZE * 853.0 / 1280.0;
+        assert!((boxed.w - ICON_SIZE).abs() < 1e-9);
+        assert!((boxed.h - want_h).abs() < 1e-6, "got h={}", boxed.h);
         assert!((boxed.x - 0.0).abs() < 1e-9);
-        assert!(boxed.y > 0.0 && boxed.y < 41.0 - boxed.h);
+        assert!(boxed.y > 0.0 && boxed.y < ICON_SIZE - boxed.h);
         // Centred vertically: equal bars above and below.
-        assert!((boxed.y - (41.0 - boxed.h - boxed.y)).abs() < 1e-9);
+        assert!((boxed.y - (ICON_SIZE - boxed.h - boxed.y)).abs() < 1e-9);
     }
 
     #[test]
@@ -2475,17 +2502,18 @@ mod tests {
         // 853×1280 (rotated) → the box flips: full height, narrow width,
         // centred horizontally — not clipped, not squashed to landscape.
         let boxed = content_box(icon(), portrait()).unwrap();
-        assert!((boxed.h - 41.0).abs() < 1e-9);
-        assert!((boxed.w - 27.32265625).abs() < 1e-6, "got w={}", boxed.w);
+        let want_w = ICON_SIZE * 853.0 / 1280.0;
+        assert!((boxed.h - ICON_SIZE).abs() < 1e-9);
+        assert!((boxed.w - want_w).abs() < 1e-6, "got w={}", boxed.w);
         assert!((boxed.y - 0.0).abs() < 1e-9);
-        assert!((boxed.x - (41.0 - boxed.w - boxed.x)).abs() < 1e-9);
+        assert!((boxed.x - (ICON_SIZE - boxed.w - boxed.x)).abs() < 1e-9);
     }
 
     #[test]
     fn content_box_square_output_fills_icon() {
         let boxed = content_box(icon(), (1000, 1000)).unwrap();
-        assert_eq!(boxed.w, 41.0);
-        assert_eq!(boxed.h, 41.0);
+        assert_eq!(boxed.w, ICON_SIZE);
+        assert_eq!(boxed.h, ICON_SIZE);
     }
 
     #[test]
@@ -2780,24 +2808,45 @@ mod tests {
 
     #[test]
     fn workspaces_section_fits_the_full_grid_at_device_width() {
-        // Device: width_px = 900, INFO_SECTION_W = 72, mid_gap 6 → the
-        // workspaces section is (900 − 72 − 12)/2 = 408px wide. All four
-        // 2×2 grid cells (4×41 + 3×8 = 188px) must fit with room to spare —
-        // a future width_px / INFO_SECTION_W / ICON_SIZE change that would
-        // start truncating workspaces fails loudly here.
+        // Device: width_px = 900, INFO_SECTION_W = 72, mid_gap 6 → 816px of
+        // free width, split 35% : 65% (WORKSPACES_SPLIT) into 286 workspaces
+        // / 530 apps. All four 2×2 grid cells (4×45 + 3×8 = 204px) must fit
+        // with room to spare — a future width_px / INFO_SECTION_W /
+        // ICON_SIZE change that would start truncating workspaces fails
+        // loudly here.
         let g = Geometry::default();
-        let main_w = section_bounds(1280.0, 746.0, &g).ws.1;
-        assert_eq!(main_w, 408.0, "device workspaces section width drifted");
-        let rects = row_layout(0.0, main_w, 200.0, 66.0, 4, 0.0);
+        let ws_w = section_bounds(1280.0, 746.0, &g).ws.1;
+        assert_eq!(ws_w, 286.0, "device workspaces section width drifted");
+        let rects = row_layout(0.0, ws_w, 200.0, 66.0, 4, 0.0);
         assert_eq!(rects.len(), 4, "all four 2×2 workspaces must fit");
         assert!(
-            rects[3].x + rects[3].w <= main_w + 1e-9,
+            rects[3].x + rects[3].w <= ws_w + 1e-9,
             "last icon must not overrun the section"
         );
-        // max_fit pin: exactly 8 icons fit at 408px; a 9th truncates (the
-        // 3×3 grid's ninth workspace would be clipped, not crash).
-        assert_eq!(row_layout(0.0, main_w, 200.0, 66.0, 8, 0.0).len(), 8);
-        assert_eq!(row_layout(0.0, main_w, 200.0, 66.0, 9, 0.0).len(), 8);
+        // max_fit pin: the column caps at 5 icons, so a hypothetical 3×3
+        // grid truncates (gracefully, not a crash) — the device grid is 2×2
+        // and all four cells fit above.
+        assert_eq!(row_layout(0.0, ws_w, 200.0, 66.0, 5, 0.0).len(), 5);
+        assert_eq!(row_layout(0.0, ws_w, 200.0, 66.0, 9, 0.0).len(), 5);
+    }
+
+    #[test]
+    fn apps_section_fits_the_nine_pin_roster_at_device_width() {
+        // The 2026-10-03 rebalance exists for this: nine pins at ICON_SIZE 45
+        // + ICON_GAP 8 span 469px, which the original even-split 408px column
+        // silently truncated (dropping the ninth pin, aerc). The apps column
+        // must fit all nine, and still keeps headroom for a tenth pin.
+        let g = Geometry::default();
+        let apps_w = section_bounds(1280.0, 746.0, &g).apps.1;
+        assert_eq!(apps_w, 530.0, "device apps section width drifted");
+        let rects = row_layout(0.0, apps_w, 200.0, 66.0, 9, 0.0);
+        assert_eq!(rects.len(), 9, "all nine pinned apps must fit");
+        assert!(
+            rects[8].x + rects[8].w <= apps_w + 1e-9,
+            "last icon must not overrun the section"
+        );
+        let ten = row_layout(0.0, apps_w, 200.0, 66.0, 10, 0.0);
+        assert_eq!(ten.len(), 10, "the column still fits a tenth pin");
     }
 
     // ---- astro slice 2: sliver fusion + travel -------------------------
@@ -3262,7 +3311,7 @@ mod tests {
         assert_eq!(apps_zone_bounds(sw, sh, &g), want);
         // Exact device values — a drift here (e.g. the section width
         // formula changing without the zone following) is loud.
-        assert_eq!(apps_zone_bounds(sw, sh, &g), (604, 749, 408, 66));
+        assert_eq!(apps_zone_bounds(sw, sh, &g), (482, 749, 530, 66));
     }
 
     #[test]
